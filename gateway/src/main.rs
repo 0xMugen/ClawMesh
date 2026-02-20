@@ -7,7 +7,10 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use opentelemetry::{global, KeyValue};
+use clawmesh_p2p::{
+    AnnounceMessage, EventBus, MeshRegistry, PeerEntry, PeerStatus,
+};
+use opentelemetry::{global, trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
@@ -19,8 +22,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 const PROTOCOL_VERSION: &str = "0.1";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 
-#[derive(Clone, Debug, Default)]
-struct AppState;
+#[derive(Clone)]
+struct AppState {
+    registry: MeshRegistry,
+    #[allow(dead_code)]
+    bus: EventBus,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Envelope {
@@ -82,16 +89,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing("clawmesh-gateway");
 
     let bind_addr = env::var("GATEWAY_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+    let mesh_id = env::var("MESH_ID").unwrap_or_else(|_| "mesh:default".to_string());
     let socket_addr: SocketAddr = bind_addr.parse()?;
+
+    let bus = EventBus::default();
+    let registry = MeshRegistry::new(&mesh_id, bus.clone());
+    let state = AppState {
+        registry,
+        bus,
+    };
 
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v0/envelope", post(route_envelope))
-        .with_state(AppState)
+        .route("/v0/peers", get(list_peers))
+        .with_state(state)
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await?;
-    info!(%socket_addr, "gateway listening");
+    info!(%socket_addr, %mesh_id, "gateway listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -107,7 +123,7 @@ fn init_tracing(service_name: &str) {
     let fmt_layer = tracing_subscriber::fmt::layer().compact().with_target(false);
 
     if let Ok(endpoint) = env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        let tracer = opentelemetry_otlp::new_pipeline()
+        let provider = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_trace_config(
                 opentelemetry_sdk::trace::Config::default()
@@ -119,8 +135,10 @@ fn init_tracing(service_name: &str) {
             .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint))
             .install_batch(opentelemetry_sdk::runtime::Tokio);
 
-        match tracer {
-            Ok(tracer) => {
+        match provider {
+            Ok(provider) => {
+                let tracer = provider.tracer(service_name.to_owned());
+                global::set_tracer_provider(provider);
                 tracing_subscriber::registry()
                     .with(env_filter)
                     .with(fmt_layer)
@@ -160,16 +178,57 @@ async fn dispatch_intent(state: &AppState, envelope: &Envelope) -> RouteResponse
 }
 
 #[instrument(skip(state, envelope))]
-async fn route_announce(_state: &AppState, envelope: &Envelope) -> RouteResponse {
+async fn route_announce(state: &AppState, envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing announce envelope");
+
+    let display_name = envelope
+        .payload
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let status_str = envelope
+        .payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("available");
+
+    let status = match status_str {
+        "busy" => PeerStatus::Busy,
+        "away" => PeerStatus::Away,
+        _ => PeerStatus::Available,
+    };
+
+    let supports = envelope
+        .payload
+        .get("supports")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let msg = AnnounceMessage {
+        agent_id: envelope.sender.agent_id.clone(),
+        mesh_id: envelope.sender.mesh_id.clone(),
+        display_name,
+        status,
+        capabilities: supports,
+    };
+
+    state.registry.handle_announce(msg).await;
+
     RouteResponse {
-        status: "stub",
+        status: "accepted",
         intent: Intent::Announce,
         route: "announce_router",
     }
 }
 
-#[instrument(skip(state, envelope))]
+#[instrument(skip(_state, envelope))]
 async fn route_request_match(_state: &AppState, envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing request_match envelope");
     RouteResponse {
@@ -179,7 +238,7 @@ async fn route_request_match(_state: &AppState, envelope: &Envelope) -> RouteRes
     }
 }
 
-#[instrument(skip(state, envelope))]
+#[instrument(skip(_state, envelope))]
 async fn route_schedule(_state: &AppState, envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing schedule envelope");
     RouteResponse {
@@ -189,7 +248,7 @@ async fn route_schedule(_state: &AppState, envelope: &Envelope) -> RouteResponse
     }
 }
 
-#[instrument(skip(state, envelope))]
+#[instrument(skip(_state, envelope))]
 async fn route_offer(_state: &AppState, envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing offer envelope");
     RouteResponse {
@@ -223,9 +282,12 @@ async fn route_envelope(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
+async fn list_peers(State(state): State<AppState>) -> Json<Vec<PeerEntry>> {
+    Json(state.registry.list_peers().await)
+}
+
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         info!("shutdown signal received");
     }
 }
-
