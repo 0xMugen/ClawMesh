@@ -24,6 +24,8 @@ pub enum CryptoError {
 /// for signing messages and exporting the public key.
 pub struct PeerIdentity {
     key_pair: Ed25519KeyPair,
+    /// Retained PKCS#8 bytes for reconstructing additional instances.
+    pkcs8_der: Vec<u8>,
 }
 
 /// Serialisable representation of a peer's public key.
@@ -46,16 +48,36 @@ impl PeerIdentity {
         let rng = SystemRandom::new();
         let pkcs8_bytes =
             Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| CryptoError::KeyGeneration)?;
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())
-            .map_err(|_| CryptoError::KeyGeneration)?;
-        Ok(Self { key_pair })
+        let der = pkcs8_bytes.as_ref().to_vec();
+        let key_pair =
+            Ed25519KeyPair::from_pkcs8(&der).map_err(|_| CryptoError::KeyGeneration)?;
+        Ok(Self {
+            key_pair,
+            pkcs8_der: der,
+        })
     }
 
     /// Reconstruct from a PKCS#8 v2 document (base64-encoded).
     pub fn from_pkcs8_base64(encoded: &str) -> Result<Self, CryptoError> {
         let der = BASE64.decode(encoded)?;
         let key_pair = Ed25519KeyPair::from_pkcs8(&der).map_err(|_| CryptoError::InvalidKey)?;
-        Ok(Self { key_pair })
+        Ok(Self {
+            key_pair,
+            pkcs8_der: der,
+        })
+    }
+
+    /// Create a second `PeerIdentity` from the same key material.
+    ///
+    /// This is used when multiple subsystems (e.g. `MeshNode` and
+    /// `PeerAuthenticator`) each need their own owned identity handle.
+    pub fn clone_for_auth(&self) -> Self {
+        let key_pair = Ed25519KeyPair::from_pkcs8(&self.pkcs8_der)
+            .expect("pkcs8 bytes should remain valid");
+        Self {
+            key_pair,
+            pkcs8_der: self.pkcs8_der.clone(),
+        }
     }
 
     /// Return the public key in serialisable form.

@@ -1,15 +1,15 @@
 use std::{env, net::SocketAddr};
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use clawmesh_p2p::{
-    AnnounceMessage, EventBus, GossipMessage, GossipRouter, MeshRegistry, PeerEntry, PeerStatus,
-    SignalMessage, SignalRelay,
+    AnnounceMessage, GossipMessage, MeshNode, PeerEntry, PeerStatus, RoomInfo, SignalMessage,
+    StateDelta, StateEntry, StateSnapshot,
 };
 use opentelemetry::{global, trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
@@ -25,11 +25,7 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 
 #[derive(Clone)]
 struct AppState {
-    registry: MeshRegistry,
-    relay: SignalRelay,
-    gossip: GossipRouter,
-    #[allow(dead_code)]
-    bus: EventBus,
+    node: MeshNode,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -109,25 +105,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_id = env::var("NODE_ID").unwrap_or_else(|_| "node:gateway-0".to_string());
     let socket_addr: SocketAddr = bind_addr.parse()?;
 
-    let bus = EventBus::default();
-    let registry = MeshRegistry::new(&mesh_id, bus.clone());
-    let relay = SignalRelay::new(bus.clone());
-    let gossip = GossipRouter::new(&node_id, registry.clone(), bus.clone());
-    let state = AppState {
-        registry,
-        relay,
-        gossip,
-        bus,
-    };
+    let node = MeshNode::new(&node_id, &mesh_id)
+        .expect("failed to generate mesh identity");
+    let state = AppState { node };
 
     let app = Router::new()
         .route("/healthz", get(health))
+        // Envelope dispatch
         .route("/v0/envelope", post(route_envelope))
         .route("/v0/peers", get(list_peers))
+        // Signal relay
         .route("/v0/signal/relay", post(relay_signal))
         .route("/v0/signal/status", get(relay_status))
+        // Gossip
         .route("/v0/gossip/exchange", post(gossip_exchange))
         .route("/v0/gossip/status", get(gossip_status))
+        // Rooms
+        .route("/v0/rooms", get(list_rooms).post(create_room))
+        .route("/v0/rooms/{room_id}/join", post(join_room))
+        .route("/v0/rooms/{room_id}/leave", post(leave_room))
+        .route("/v0/rooms/{room_id}/members", get(room_members))
+        // Room state
+        .route("/v0/rooms/{room_id}/state", get(list_state).post(set_state))
+        .route("/v0/rooms/{room_id}/state/{key}", get(get_state))
+        .route("/v0/rooms/{room_id}/state/delta", post(apply_delta))
+        .route("/v0/rooms/{room_id}/state/snapshot", get(get_snapshot).post(restore_snapshot))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -192,13 +194,17 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Envelope dispatch
+// ---------------------------------------------------------------------------
+
 #[instrument(skip(state, envelope))]
 async fn dispatch_intent(state: &AppState, envelope: &Envelope) -> RouteResponse {
     match envelope.intent {
         Intent::Announce => route_announce(state, envelope).await,
-        Intent::RequestMatch => route_request_match(state, envelope).await,
-        Intent::Schedule => route_schedule(state, envelope).await,
-        Intent::Offer => route_offer(state, envelope).await,
+        Intent::RequestMatch => route_request_match(envelope).await,
+        Intent::Schedule => route_schedule(envelope).await,
+        Intent::Offer => route_offer(envelope).await,
     }
 }
 
@@ -244,11 +250,12 @@ async fn route_announce(state: &AppState, envelope: &Envelope) -> RouteResponse 
         capabilities: supports,
     };
 
-    state.registry.handle_announce(msg).await;
+    state.node.registry().handle_announce(msg).await;
 
     // Auto-register the announcing peer with the signal relay
     state
-        .relay
+        .node
+        .relay()
         .register(&envelope.sender.agent_id, 64)
         .await;
 
@@ -259,8 +266,8 @@ async fn route_announce(state: &AppState, envelope: &Envelope) -> RouteResponse 
     }
 }
 
-#[instrument(skip(_state, envelope))]
-async fn route_request_match(_state: &AppState, envelope: &Envelope) -> RouteResponse {
+#[instrument(skip(envelope))]
+async fn route_request_match(envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing request_match envelope");
     RouteResponse {
         status: "stub",
@@ -269,8 +276,8 @@ async fn route_request_match(_state: &AppState, envelope: &Envelope) -> RouteRes
     }
 }
 
-#[instrument(skip(_state, envelope))]
-async fn route_schedule(_state: &AppState, envelope: &Envelope) -> RouteResponse {
+#[instrument(skip(envelope))]
+async fn route_schedule(envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing schedule envelope");
     RouteResponse {
         status: "stub",
@@ -279,8 +286,8 @@ async fn route_schedule(_state: &AppState, envelope: &Envelope) -> RouteResponse
     }
 }
 
-#[instrument(skip(_state, envelope))]
-async fn route_offer(_state: &AppState, envelope: &Envelope) -> RouteResponse {
+#[instrument(skip(envelope))]
+async fn route_offer(envelope: &Envelope) -> RouteResponse {
     info!(capability = %envelope.capability, "routing offer envelope");
     RouteResponse {
         status: "stub",
@@ -314,20 +321,19 @@ async fn route_envelope(
 }
 
 async fn list_peers(State(state): State<AppState>) -> Json<Vec<PeerEntry>> {
-    Json(state.registry.list_peers().await)
+    Json(state.node.registry().list_peers().await)
 }
 
 // ---------------------------------------------------------------------------
 // Signal relay endpoints
 // ---------------------------------------------------------------------------
 
-/// POST /v0/signal/relay — Forward a signaling message to the target peer.
 #[instrument(skip(state, msg))]
 async fn relay_signal(
     State(state): State<AppState>,
     Json(msg): Json<SignalMessage>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    state.relay.relay(msg).await.map_err(|e| {
+    state.node.relay().relay(msg).await.map_err(|e| {
         let detail = e.to_string();
         error!(%detail, "signal relay failed");
         (
@@ -341,11 +347,10 @@ async fn relay_signal(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// GET /v0/signal/status — Show relay registration count.
 async fn relay_status(State(state): State<AppState>) -> Json<RelayStatusResponse> {
     Json(RelayStatusResponse {
         status: "ok",
-        registered_peers: state.relay.peer_count().await,
+        registered_peers: state.node.relay().peer_count().await,
     })
 }
 
@@ -353,9 +358,6 @@ async fn relay_status(State(state): State<AppState>) -> Json<RelayStatusResponse
 // Gossip exchange endpoints
 // ---------------------------------------------------------------------------
 
-/// POST /v0/gossip/exchange — Accept a gossip message from a remote node.
-/// The remote node sends either a Pull (its digest) or a Push (entries we need).
-/// For Pull messages, the response contains a Push with our delta.
 #[instrument(skip(state, body))]
 async fn gossip_exchange(
     State(state): State<AppState>,
@@ -364,7 +366,7 @@ async fn gossip_exchange(
     match body.message {
         GossipMessage::Pull(pull) => {
             let from = pull.from.clone();
-            let push = state.registry.handle_gossip_pull(pull).await;
+            let push = state.node.registry().handle_gossip_pull(pull).await;
             let entry_count = push.entries.len();
             info!(%from, entries = entry_count, "handled gossip pull from remote node");
             Ok(Json(GossipExchangeResponse {
@@ -374,7 +376,7 @@ async fn gossip_exchange(
         }
         GossipMessage::Push(push) => {
             let entry_count = push.entries.len();
-            state.registry.merge_gossip_push(push).await;
+            state.node.registry().merge_gossip_push(push).await;
             info!(entries = entry_count, "merged gossip push from remote node");
             Ok(Json(GossipExchangeResponse {
                 status: "ok",
@@ -395,13 +397,321 @@ struct GossipExchangeResponse {
     message: Option<GossipMessage>,
 }
 
-/// GET /v0/gossip/status — Show gossip router status.
 async fn gossip_status(State(state): State<AppState>) -> Json<GossipStatusResponse> {
     Json(GossipStatusResponse {
-        node_id: state.gossip.node_id().to_string(),
-        connected_peers: state.gossip.peer_count().await,
-        registry_size: state.registry.peer_count().await,
+        node_id: state.node.gossip().node_id().to_string(),
+        connected_peers: state.node.gossip().peer_count().await,
+        registry_size: state.node.registry().peer_count().await,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Room endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CreateRoomRequest {
+    room_id: String,
+    name: String,
+    max_members: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct RoomResponse {
+    status: &'static str,
+    room: Option<RoomInfo>,
+}
+
+/// POST /v0/rooms — Create a new room.
+#[instrument(skip(state, body))]
+async fn create_room(
+    State(state): State<AppState>,
+    Json(body): Json<CreateRoomRequest>,
+) -> Result<(StatusCode, Json<RoomResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let room = state
+        .node
+        .rooms()
+        .create_room(&body.room_id, &body.name, body.max_members)
+        .await;
+
+    match room {
+        Some(info) => {
+            // Auto-init state tracking for the new room.
+            state.node.state().init_room(&body.room_id).await;
+            info!(room_id = %body.room_id, "room created");
+            Ok((
+                StatusCode::CREATED,
+                Json(RoomResponse {
+                    status: "created",
+                    room: Some(info),
+                }),
+            ))
+        }
+        None => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "room_exists",
+                detail: format!("room {} already exists", body.room_id),
+            }),
+        )),
+    }
+}
+
+/// GET /v0/rooms — List all rooms.
+async fn list_rooms(State(state): State<AppState>) -> Json<Vec<RoomInfo>> {
+    Json(state.node.rooms().list_rooms().await)
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinLeaveRequest {
+    agent_id: String,
+}
+
+/// POST /v0/rooms/:room_id/join — Join a room.
+#[instrument(skip(state, body))]
+async fn join_room(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Json(body): Json<JoinLeaveRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .rooms()
+        .join_room(&room_id, &body.agent_id)
+        .await
+        .map_err(|e| {
+            let detail = e.to_string();
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "join_failed",
+                    detail,
+                }),
+            )
+        })?;
+    Ok(StatusCode::OK)
+}
+
+/// POST /v0/rooms/:room_id/leave — Leave a room.
+#[instrument(skip(state, body))]
+async fn leave_room(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Json(body): Json<JoinLeaveRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .rooms()
+        .leave_room(&room_id, &body.agent_id)
+        .await
+        .map_err(|e| {
+            let detail = e.to_string();
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "leave_failed",
+                    detail,
+                }),
+            )
+        })?;
+    Ok(StatusCode::OK)
+}
+
+/// GET /v0/rooms/:room_id/members — List room members.
+async fn room_members(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .rooms()
+        .room_members(&room_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "room_not_found",
+                    detail: e.to_string(),
+                }),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Room state endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SetStateRequest {
+    agent_id: String,
+    key: String,
+    value: Value,
+}
+
+/// POST /v0/rooms/:room_id/state — Set a state key.
+#[instrument(skip(state, body))]
+async fn set_state(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Json(body): Json<SetStateRequest>,
+) -> Result<(StatusCode, Json<StateEntry>), (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .state()
+        .set(&room_id, &body.agent_id, &body.key, body.value)
+        .await
+        .map(|entry| (StatusCode::OK, Json(entry)))
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "state_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })
+}
+
+/// GET /v0/rooms/:room_id/state — List all state entries.
+async fn list_state(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> Result<Json<Vec<StateEntry>>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .state()
+        .list_entries(&room_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "state_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })
+}
+
+/// GET /v0/rooms/:room_id/state/:key — Get a single state entry.
+async fn get_state(
+    State(state): State<AppState>,
+    Path((room_id, key)): Path<(String, String)>,
+) -> Result<Json<StateEntry>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .state()
+        .get(&room_id, &key)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "state_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })
+}
+
+/// POST /v0/rooms/:room_id/state/delta — Apply a state delta from a remote peer.
+#[instrument(skip(state, body))]
+async fn apply_delta(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Json(body): Json<StateDelta>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
+    if body.room_id != room_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "room_id_mismatch",
+                detail: format!(
+                    "path room_id '{}' does not match delta room_id '{}'",
+                    room_id, body.room_id
+                ),
+            }),
+        ));
+    }
+
+    state
+        .node
+        .state()
+        .apply_delta(body)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "state_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })
+}
+
+/// GET /v0/rooms/:room_id/state/snapshot — Get a full state snapshot.
+async fn get_snapshot(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> Result<Json<StateSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .state()
+        .snapshot(&room_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "state_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })
+}
+
+/// POST /v0/rooms/:room_id/state/snapshot — Restore state from a snapshot.
+#[instrument(skip(state, body))]
+async fn restore_snapshot(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Json(body): Json<StateSnapshot>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
+    if body.room_id != room_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "room_id_mismatch",
+                detail: format!(
+                    "path room_id '{}' does not match snapshot room_id '{}'",
+                    room_id, body.room_id
+                ),
+            }),
+        ));
+    }
+
+    state
+        .node
+        .state()
+        .restore_snapshot(body)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "state_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })
 }
 
 async fn shutdown_signal() {
