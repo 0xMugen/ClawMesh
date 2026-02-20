@@ -8,7 +8,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use clawmesh_p2p::{
-    AnnounceMessage, EventBus, MeshRegistry, PeerEntry, PeerStatus,
+    AnnounceMessage, EventBus, GossipMessage, GossipRouter, MeshRegistry, PeerEntry, PeerStatus,
+    SignalMessage, SignalRelay,
 };
 use opentelemetry::{global, trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
@@ -25,6 +26,8 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 #[derive(Clone)]
 struct AppState {
     registry: MeshRegistry,
+    relay: SignalRelay,
+    gossip: GossipRouter,
     #[allow(dead_code)]
     bus: EventBus,
 }
@@ -84,18 +87,36 @@ struct ErrorResponse {
     detail: String,
 }
 
+#[derive(Debug, Serialize)]
+struct RelayStatusResponse {
+    status: &'static str,
+    registered_peers: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GossipStatusResponse {
+    node_id: String,
+    connected_peers: usize,
+    registry_size: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing("clawmesh-gateway");
 
     let bind_addr = env::var("GATEWAY_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
     let mesh_id = env::var("MESH_ID").unwrap_or_else(|_| "mesh:default".to_string());
+    let node_id = env::var("NODE_ID").unwrap_or_else(|_| "node:gateway-0".to_string());
     let socket_addr: SocketAddr = bind_addr.parse()?;
 
     let bus = EventBus::default();
     let registry = MeshRegistry::new(&mesh_id, bus.clone());
+    let relay = SignalRelay::new(bus.clone());
+    let gossip = GossipRouter::new(&node_id, registry.clone(), bus.clone());
     let state = AppState {
         registry,
+        relay,
+        gossip,
         bus,
     };
 
@@ -103,11 +124,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/v0/envelope", post(route_envelope))
         .route("/v0/peers", get(list_peers))
+        .route("/v0/signal/relay", post(relay_signal))
+        .route("/v0/signal/status", get(relay_status))
+        .route("/v0/gossip/exchange", post(gossip_exchange))
+        .route("/v0/gossip/status", get(gossip_status))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await?;
-    info!(%socket_addr, %mesh_id, "gateway listening");
+    info!(%socket_addr, %mesh_id, %node_id, "gateway listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -221,6 +246,12 @@ async fn route_announce(state: &AppState, envelope: &Envelope) -> RouteResponse 
 
     state.registry.handle_announce(msg).await;
 
+    // Auto-register the announcing peer with the signal relay
+    state
+        .relay
+        .register(&envelope.sender.agent_id, 64)
+        .await;
+
     RouteResponse {
         status: "accepted",
         intent: Intent::Announce,
@@ -284,6 +315,93 @@ async fn route_envelope(
 
 async fn list_peers(State(state): State<AppState>) -> Json<Vec<PeerEntry>> {
     Json(state.registry.list_peers().await)
+}
+
+// ---------------------------------------------------------------------------
+// Signal relay endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /v0/signal/relay — Forward a signaling message to the target peer.
+#[instrument(skip(state, msg))]
+async fn relay_signal(
+    State(state): State<AppState>,
+    Json(msg): Json<SignalMessage>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state.relay.relay(msg).await.map_err(|e| {
+        let detail = e.to_string();
+        error!(%detail, "signal relay failed");
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "relay_failed",
+                detail,
+            }),
+        )
+    })?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// GET /v0/signal/status — Show relay registration count.
+async fn relay_status(State(state): State<AppState>) -> Json<RelayStatusResponse> {
+    Json(RelayStatusResponse {
+        status: "ok",
+        registered_peers: state.relay.peer_count().await,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Gossip exchange endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /v0/gossip/exchange — Accept a gossip message from a remote node.
+/// The remote node sends either a Pull (its digest) or a Push (entries we need).
+/// For Pull messages, the response contains a Push with our delta.
+#[instrument(skip(state, body))]
+async fn gossip_exchange(
+    State(state): State<AppState>,
+    Json(body): Json<GossipExchangeRequest>,
+) -> Result<Json<GossipExchangeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match body.message {
+        GossipMessage::Pull(pull) => {
+            let from = pull.from.clone();
+            let push = state.registry.handle_gossip_pull(pull).await;
+            let entry_count = push.entries.len();
+            info!(%from, entries = entry_count, "handled gossip pull from remote node");
+            Ok(Json(GossipExchangeResponse {
+                status: "ok",
+                message: Some(GossipMessage::Push(push)),
+            }))
+        }
+        GossipMessage::Push(push) => {
+            let entry_count = push.entries.len();
+            state.registry.merge_gossip_push(push).await;
+            info!(entries = entry_count, "merged gossip push from remote node");
+            Ok(Json(GossipExchangeResponse {
+                status: "ok",
+                message: None,
+            }))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GossipExchangeRequest {
+    message: GossipMessage,
+}
+
+#[derive(Debug, Serialize)]
+struct GossipExchangeResponse {
+    status: &'static str,
+    message: Option<GossipMessage>,
+}
+
+/// GET /v0/gossip/status — Show gossip router status.
+async fn gossip_status(State(state): State<AppState>) -> Json<GossipStatusResponse> {
+    Json(GossipStatusResponse {
+        node_id: state.gossip.node_id().to_string(),
+        connected_peers: state.gossip.peer_count().await,
+        registry_size: state.registry.peer_count().await,
+    })
 }
 
 async fn shutdown_signal() {
