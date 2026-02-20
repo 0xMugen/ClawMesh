@@ -102,10 +102,8 @@ impl MeshRegistry {
             agent_id: msg.agent_id.clone(),
             mesh_id: msg.mesh_id,
         });
-        self.bus.emit_patch_ready(
-            &self.mesh_id,
-            &format!("peer {} announced", msg.agent_id),
-        );
+        self.bus
+            .emit_patch_ready(&self.mesh_id, &format!("peer {} announced", msg.agent_id));
 
         entry
     }
@@ -121,10 +119,8 @@ impl MeshRegistry {
                 agent_id: agent_id.to_string(),
                 mesh_id: self.mesh_id.clone(),
             });
-            self.bus.emit_patch_ready(
-                &self.mesh_id,
-                &format!("peer {} departed", agent_id),
-            );
+            self.bus
+                .emit_patch_ready(&self.mesh_id, &format!("peer {} departed", agent_id));
         }
 
         removed
@@ -251,10 +247,7 @@ impl MeshRegistry {
                 let agent_id = entry.agent_id.clone();
                 let mesh_id = entry.mesh_id.clone();
                 peers.insert(agent_id.clone(), entry);
-                self.bus.emit(Event::PeerAnnounced {
-                    agent_id,
-                    mesh_id,
-                });
+                self.bus.emit(Event::PeerAnnounced { agent_id, mesh_id });
             }
         }
     }

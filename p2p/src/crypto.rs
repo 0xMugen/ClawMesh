@@ -49,8 +49,7 @@ impl PeerIdentity {
         let pkcs8_bytes =
             Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| CryptoError::KeyGeneration)?;
         let der = pkcs8_bytes.as_ref().to_vec();
-        let key_pair =
-            Ed25519KeyPair::from_pkcs8(&der).map_err(|_| CryptoError::KeyGeneration)?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(&der).map_err(|_| CryptoError::KeyGeneration)?;
         Ok(Self {
             key_pair,
             pkcs8_der: der,
@@ -72,8 +71,8 @@ impl PeerIdentity {
     /// This is used when multiple subsystems (e.g. `MeshNode` and
     /// `PeerAuthenticator`) each need their own owned identity handle.
     pub fn clone_for_auth(&self) -> Self {
-        let key_pair = Ed25519KeyPair::from_pkcs8(&self.pkcs8_der)
-            .expect("pkcs8 bytes should remain valid");
+        let key_pair =
+            Ed25519KeyPair::from_pkcs8(&self.pkcs8_der).expect("pkcs8 bytes should remain valid");
         Self {
             key_pair,
             pkcs8_der: self.pkcs8_der.clone(),
@@ -105,8 +104,7 @@ pub fn verify(
     let key_bytes = BASE64.decode(&public_key.key)?;
     let sig_bytes = BASE64.decode(&signature.sig)?;
 
-    let peer_public_key =
-        UnparsedPublicKey::new(&signature::ED25519, &key_bytes);
+    let peer_public_key = UnparsedPublicKey::new(&signature::ED25519, &key_bytes);
 
     peer_public_key
         .verify(message, &sig_bytes)

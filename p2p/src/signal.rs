@@ -89,14 +89,8 @@ pub fn signaling_pair() -> (SignalingChannel, SignalingChannel) {
 
 /// Stub: relay a signal message toward the target peer.
 /// In production this would look up the peer's signaling channel and forward.
-pub async fn relay_signal(
-    _target_agent_id: &str,
-    msg: SignalMessage,
-) -> Result<(), SignalError> {
-    tracing::info!(
-        ?msg,
-        "relay_signal stub: would forward to target peer"
-    );
+pub async fn relay_signal(_target_agent_id: &str, msg: SignalMessage) -> Result<(), SignalError> {
+    tracing::info!(?msg, "relay_signal stub: would forward to target peer");
     Ok(())
 }
 

@@ -37,7 +37,12 @@ impl RoomManager {
     }
 
     /// Create a new room. Returns the room info or None if it already exists.
-    pub async fn create_room(&self, room_id: &str, name: &str, max_members: Option<usize>) -> Option<RoomInfo> {
+    pub async fn create_room(
+        &self,
+        room_id: &str,
+        name: &str,
+        max_members: Option<usize>,
+    ) -> Option<RoomInfo> {
         let mut rooms = self.rooms.write().await;
         if rooms.contains_key(room_id) {
             return None;

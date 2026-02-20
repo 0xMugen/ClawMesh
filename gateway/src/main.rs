@@ -100,19 +100,8 @@ struct GossipStatusResponse {
     registry_size: usize,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing("clawmesh-gateway");
-
-    let bind_addr = env::var("GATEWAY_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
-    let mesh_id = env::var("MESH_ID").unwrap_or_else(|_| "mesh:default".to_string());
-    let node_id = env::var("NODE_ID").unwrap_or_else(|_| "node:gateway-0".to_string());
-    let socket_addr: SocketAddr = bind_addr.parse()?;
-
-    let node = MeshNode::new(&node_id, &mesh_id).expect("failed to generate mesh identity");
-    let state = AppState { node };
-
-    let app = Router::new()
+fn build_router(state: AppState) -> Router {
+    Router::new()
         .route("/healthz", get(health))
         // Envelope dispatch
         .route("/v0/envelope", post(route_envelope))
@@ -126,18 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v0/gossip/status", get(gossip_status))
         // Rooms
         .route("/v0/rooms", get(list_rooms).post(create_room))
-        .route("/v0/rooms/{room_id}/join", post(join_room))
-        .route("/v0/rooms/{room_id}/leave", post(leave_room))
-        .route("/v0/rooms/{room_id}/members", get(room_members))
+        .route("/v0/rooms/:room_id/join", post(join_room))
+        .route("/v0/rooms/:room_id/leave", post(leave_room))
+        .route("/v0/rooms/:room_id/members", get(room_members))
         // Room state
+        .route("/v0/rooms/:room_id/state", get(list_state).post(set_state))
+        .route("/v0/rooms/:room_id/state/:key", get(get_state))
+        .route("/v0/rooms/:room_id/state/delta", post(apply_delta))
         .route(
-            "/v0/rooms/{room_id}/state",
-            get(list_state).post(set_state),
-        )
-        .route("/v0/rooms/{room_id}/state/{key}", get(get_state))
-        .route("/v0/rooms/{room_id}/state/delta", post(apply_delta))
-        .route(
-            "/v0/rooms/{room_id}/state/snapshot",
+            "/v0/rooms/:room_id/state/snapshot",
             get(get_snapshot).post(restore_snapshot),
         )
         // Matchmaking
@@ -146,15 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(list_match_requests).post(submit_match_request),
         )
         .route(
-            "/v0/matchmaking/requests/{request_id}",
+            "/v0/matchmaking/requests/:request_id",
             get(get_match_request),
         )
         .route(
-            "/v0/matchmaking/requests/{request_id}/matches",
+            "/v0/matchmaking/requests/:request_id/matches",
             get(find_matches),
         )
         .route(
-            "/v0/matchmaking/requests/{request_id}/cancel",
+            "/v0/matchmaking/requests/:request_id/cancel",
             post(cancel_match_request),
         )
         // Scheduling
@@ -163,11 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(list_schedules).post(propose_schedule),
         )
         .route(
-            "/v0/matchmaking/schedules/{schedule_id}/confirm",
+            "/v0/matchmaking/schedules/:schedule_id/confirm",
             post(confirm_schedule),
         )
         .route(
-            "/v0/matchmaking/schedules/{schedule_id}/decline",
+            "/v0/matchmaking/schedules/:schedule_id/decline",
             post(decline_schedule),
         )
         // Offers
@@ -175,13 +161,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v0/matchmaking/offers",
             get(list_offers).post(submit_offer),
         )
-        .route("/v0/matchmaking/offers/{offer_id}", get(get_offer))
+        .route("/v0/matchmaking/offers/:offer_id", get(get_offer))
         .route(
-            "/v0/matchmaking/offers/{offer_id}/withdraw",
+            "/v0/matchmaking/offers/:offer_id/withdraw",
             post(withdraw_offer),
         )
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing("clawmesh-gateway");
+
+    let bind_addr = env::var("GATEWAY_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+    let mesh_id = env::var("MESH_ID").unwrap_or_else(|_| "mesh:default".to_string());
+    let node_id = env::var("NODE_ID").unwrap_or_else(|_| "node:gateway-0".to_string());
+    let socket_addr: SocketAddr = bind_addr.parse()?;
+
+    let node = MeshNode::new(&node_id, &mesh_id).expect("failed to generate mesh identity");
+    let state = AppState { node };
+
+    let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(socket_addr).await?;
     info!(%socket_addr, %mesh_id, %node_id, "gateway listening");
@@ -197,16 +198,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn init_tracing(service_name: &str) {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("gateway=info,tower_http=info"));
-    let fmt_layer = tracing_subscriber::fmt::layer().compact().with_target(false);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_target(false);
 
     if let Ok(endpoint) = env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
         let provider = opentelemetry_otlp::new_pipeline()
             .tracing()
-            .with_trace_config(
-                opentelemetry_sdk::trace::Config::default().with_resource(Resource::new(vec![
-                    KeyValue::new("service.name", service_name.to_owned()),
-                ])),
-            )
+            .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
+                Resource::new(vec![KeyValue::new("service.name", service_name.to_owned())]),
+            ))
             .with_exporter(
                 opentelemetry_otlp::new_exporter()
                     .tonic()
@@ -1249,7 +1250,12 @@ async fn submit_offer(
     let offer = state
         .node
         .matchmaker()
-        .submit_offer(&body.from_agent, &body.offer_id, &body.summary, body.expires_at)
+        .submit_offer(
+            &body.from_agent,
+            &body.offer_id,
+            &body.summary,
+            body.expires_at,
+        )
         .await;
     info!(offer_id = %offer.offer_id, from = %body.from_agent, "offer submitted");
     (StatusCode::CREATED, Json(offer))
@@ -1311,5 +1317,993 @@ async fn withdraw_offer(
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         info!("shutdown signal received");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use hyper::Request;
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let node = MeshNode::new("node-test", "mesh-test").unwrap();
+        AppState { node }
+    }
+
+    fn test_app() -> Router {
+        build_router(test_state())
+    }
+
+    async fn body_json(body: Body) -> Value {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::get(path.parse::<hyper::Uri>().unwrap())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn post_json(path: &str, body: &Value) -> Request<Body> {
+        Request::post(path.parse::<hyper::Uri>().unwrap())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn post_empty(path: &str) -> Request<Body> {
+        Request::post(path.parse::<hyper::Uri>().unwrap())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn make_envelope(intent: &str, policy: &str, payload: Value) -> Value {
+        serde_json::json!({
+            "schema_version": "0.1",
+            "intent": intent,
+            "capability": "matchmaking",
+            "policy": policy,
+            "timestamp": "2026-02-20T12:00:00Z",
+            "sender": {
+                "agent_id": "agent-alice",
+                "mesh_id": "mesh-test"
+            },
+            "payload": payload
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Health
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn health_check() {
+        let app = test_app();
+        let resp = app.oneshot(get("/healthz")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["service"], "clawmesh-gateway");
+    }
+
+    // -----------------------------------------------------------------------
+    // Envelope dispatch — announce
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn envelope_announce_accepted() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({
+                "display_name": "Alice",
+                "supports": ["matchmaking"],
+                "status": "available"
+            }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["intent"], "announce");
+    }
+
+    #[tokio::test]
+    async fn envelope_registers_peer() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let envelope = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({
+                "display_name": "Bob",
+                "supports": ["matchmaking"],
+                "status": "busy"
+            }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/peers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let peers = body.as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["agent_id"], "agent-alice");
+        assert_eq!(peers[0]["display_name"], "Bob");
+        assert_eq!(peers[0]["status"], "busy");
+    }
+
+    // -----------------------------------------------------------------------
+    // Envelope dispatch — request_match
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn envelope_request_match_accepted() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "request_match",
+            "public",
+            serde_json::json!({
+                "game": "golf-18",
+                "skill_range": { "min": 50.0, "max": 80.0 },
+                "time_window": {
+                    "start": "2026-02-20T14:00:00Z",
+                    "end": "2026-02-20T16:00:00Z"
+                }
+            }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["intent"], "request_match");
+    }
+
+    // -----------------------------------------------------------------------
+    // Envelope dispatch — schedule
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn envelope_schedule_accepted() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "schedule",
+            "public",
+            serde_json::json!({
+                "slot_start": "2026-02-20T14:00:00Z",
+                "slot_end": "2026-02-20T16:00:00Z",
+                "state": "proposed"
+            }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["intent"], "schedule");
+    }
+
+    // -----------------------------------------------------------------------
+    // Envelope dispatch — offer
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn envelope_offer_accepted() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "offer",
+            "public",
+            serde_json::json!({
+                "offer_id": "offer-1",
+                "summary": "Join my golf round",
+                "expires_at": "2026-02-21T00:00:00Z"
+            }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["intent"], "offer");
+    }
+
+    // -----------------------------------------------------------------------
+    // Envelope — invalid schema version
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn envelope_rejects_bad_schema_version() {
+        let app = test_app();
+        let mut envelope = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        envelope["schema_version"] = serde_json::json!("999.0");
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "invalid_schema_version");
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy enforcement — mesh-only
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn policy_mesh_only_wrong_mesh_rejected() {
+        let app = test_app();
+        let mut envelope = make_envelope(
+            "announce",
+            "mesh-only",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        envelope["sender"]["mesh_id"] = serde_json::json!("mesh-other");
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "policy_violation");
+    }
+
+    #[tokio::test]
+    async fn policy_mesh_only_correct_mesh_accepted() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "announce",
+            "mesh-only",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy enforcement — private
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn policy_private_unregistered_peer_rejected() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "announce",
+            "private",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "policy_violation");
+    }
+
+    #[tokio::test]
+    async fn policy_private_registered_peer_accepted() {
+        let state = test_state();
+        // First, register the peer via a public announce
+        let app = build_router(state.clone());
+        let announce = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "Alice", "supports": [], "status": "available" }),
+        );
+        app.oneshot(post_json("/v0/envelope", &announce))
+            .await
+            .unwrap();
+
+        // Now send a private envelope from the same peer
+        let app = build_router(state);
+        let private_env = make_envelope(
+            "announce",
+            "private",
+            serde_json::json!({ "display_name": "Alice v2", "supports": ["chat"], "status": "busy" }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &private_env))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer search
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_peers_by_status() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let env1 = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "Alice", "supports": [], "status": "available" }),
+        );
+        app.oneshot(post_json("/v0/envelope", &env1)).await.unwrap();
+
+        let app = build_router(state.clone());
+        let mut env2 = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "Bob", "supports": [], "status": "busy" }),
+        );
+        env2["sender"]["agent_id"] = serde_json::json!("agent-bob");
+        app.oneshot(post_json("/v0/envelope", &env2)).await.unwrap();
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/peers/search?status=busy"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let peers = body.as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["agent_id"], "agent-bob");
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal relay
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn signal_relay_status() {
+        let app = test_app();
+        let resp = app.oneshot(get("/v0/signal/status")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn signal_relay_to_unknown_peer() {
+        let app = test_app();
+        let msg = serde_json::json!({
+            "type": "Offer",
+            "from": "agent-alice",
+            "to": "agent-nobody",
+            "sdp": "v=0\r\n..."
+        });
+        let resp = app
+            .oneshot(post_json("/v0/signal/relay", &msg))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Gossip
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn gossip_status() {
+        let app = test_app();
+        let resp = app.oneshot(get("/v0/gossip/status")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert!(body["node_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn gossip_pull_exchange() {
+        let app = test_app();
+        let pull = serde_json::json!({
+            "message": {
+                "type": "Pull",
+                "from": "node-remote",
+                "digests": []
+            }
+        });
+        let resp = app
+            .oneshot(post_json("/v0/gossip/exchange", &pull))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rooms
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_and_list_rooms() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let body = serde_json::json!({ "room_id": "lobby", "name": "Lobby" });
+        let resp = app.oneshot(post_json("/v0/rooms", &body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/rooms")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let rooms = body.as_array().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0]["room_id"], "lobby");
+    }
+
+    #[tokio::test]
+    async fn duplicate_room_returns_conflict() {
+        let state = test_state();
+        let body = serde_json::json!({ "room_id": "lobby", "name": "Lobby" });
+
+        let app = build_router(state.clone());
+        app.oneshot(post_json("/v0/rooms", &body)).await.unwrap();
+
+        let app = build_router(state);
+        let resp = app.oneshot(post_json("/v0/rooms", &body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn join_and_list_members() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let create = serde_json::json!({ "room_id": "test-room", "name": "Test" });
+        app.oneshot(post_json("/v0/rooms", &create)).await.unwrap();
+
+        let app = build_router(state.clone());
+        let join = serde_json::json!({ "agent_id": "agent-alice" });
+        let resp = app
+            .oneshot(post_json("/v0/rooms/test-room/join", &join))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/rooms/test-room/members"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let members = body.as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0], "agent-alice");
+    }
+
+    #[tokio::test]
+    async fn leave_room() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let create = serde_json::json!({ "room_id": "test-room", "name": "Test" });
+        app.oneshot(post_json("/v0/rooms", &create)).await.unwrap();
+
+        let app = build_router(state.clone());
+        let join = serde_json::json!({ "agent_id": "agent-alice" });
+        app.oneshot(post_json("/v0/rooms/test-room/join", &join))
+            .await
+            .unwrap();
+
+        let app = build_router(state.clone());
+        let leave = serde_json::json!({ "agent_id": "agent-alice" });
+        let resp = app
+            .oneshot(post_json("/v0/rooms/test-room/leave", &leave))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/rooms/test-room/members"))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_nonexistent_room() {
+        let app = test_app();
+        let join = serde_json::json!({ "agent_id": "agent-alice" });
+        let resp = app
+            .oneshot(post_json("/v0/rooms/no-such-room/join", &join))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Room state
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_and_get_state() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let create = serde_json::json!({ "room_id": "state-room", "name": "S" });
+        app.oneshot(post_json("/v0/rooms", &create)).await.unwrap();
+
+        let app = build_router(state.clone());
+        let set_body = serde_json::json!({
+            "agent_id": "agent-alice",
+            "key": "score",
+            "value": 42
+        });
+        let resp = app
+            .oneshot(post_json("/v0/rooms/state-room/state", &set_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/rooms/state-room/state/score"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["key"], "score");
+        assert_eq!(body["value"], 42);
+    }
+
+    #[tokio::test]
+    async fn list_state_entries() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let create = serde_json::json!({ "room_id": "state-room", "name": "S" });
+        app.oneshot(post_json("/v0/rooms", &create)).await.unwrap();
+
+        for key in ["a", "b"] {
+            let app = build_router(state.clone());
+            let set_body = serde_json::json!({
+                "agent_id": "agent-alice",
+                "key": key,
+                "value": key
+            });
+            app.oneshot(post_json("/v0/rooms/state-room/state", &set_body))
+                .await
+                .unwrap();
+        }
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/rooms/state-room/state"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_roundtrip() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let create = serde_json::json!({ "room_id": "snap-room", "name": "Snap" });
+        app.oneshot(post_json("/v0/rooms", &create)).await.unwrap();
+
+        let app = build_router(state.clone());
+        let set_body = serde_json::json!({ "agent_id": "agent-alice", "key": "x", "value": 1 });
+        app.oneshot(post_json("/v0/rooms/snap-room/state", &set_body))
+            .await
+            .unwrap();
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/rooms/snap-room/state/snapshot"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let snapshot = body_json(resp.into_body()).await;
+        assert_eq!(snapshot["room_id"], "snap-room");
+        assert!(snapshot["entries"].as_object().unwrap().contains_key("x"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Matchmaking REST endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn submit_and_list_match_requests() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "agent_id": "agent-alice",
+            "game": "golf-18",
+            "skill_range": { "min": 50.0, "max": 80.0 },
+            "time_window": {
+                "start": "2026-02-20T14:00:00Z",
+                "end": "2026-02-20T16:00:00Z"
+            }
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/requests", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp.into_body()).await;
+        assert!(!created["request_id"].as_str().unwrap().is_empty());
+
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/matchmaking/requests")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_match_request_not_found() {
+        let app = test_app();
+        let resp = app
+            .oneshot(get("/v0/matchmaking/requests/nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_match_request() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "agent_id": "agent-alice",
+            "game": "golf-18",
+            "skill_range": { "min": 50.0, "max": 80.0 },
+            "time_window": {
+                "start": "2026-02-20T14:00:00Z",
+                "end": "2026-02-20T16:00:00Z"
+            }
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/requests", &body))
+            .await
+            .unwrap();
+        let created = body_json(resp.into_body()).await;
+        let request_id = created["request_id"].as_str().unwrap();
+
+        let app = build_router(state.clone());
+        let cancel_path = format!("/v0/matchmaking/requests/{}/cancel", request_id);
+        let resp = app.oneshot(post_empty(&cancel_path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/matchmaking/requests")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_matches_between_compatible_requests() {
+        let state = test_state();
+
+        for agent in ["agent-alice", "agent-bob"] {
+            let app = build_router(state.clone());
+            let body = serde_json::json!({
+                "agent_id": agent,
+                "game": "golf-18",
+                "skill_range": { "min": 50.0, "max": 80.0 },
+                "time_window": {
+                    "start": "2026-02-20T14:00:00Z",
+                    "end": "2026-02-20T16:00:00Z"
+                }
+            });
+            app.oneshot(post_json("/v0/matchmaking/requests", &body))
+                .await
+                .unwrap();
+        }
+
+        let app = build_router(state.clone());
+        let resp = app.oneshot(get("/v0/matchmaking/requests")).await.unwrap();
+        let reqs = body_json(resp.into_body()).await;
+        let alice_req = reqs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["agent_id"] == "agent-alice")
+            .unwrap();
+        let request_id = alice_req["request_id"].as_str().unwrap();
+
+        let app = build_router(state);
+        let matches_path = format!("/v0/matchmaking/requests/{}/matches", request_id);
+        let resp = app.oneshot(get(&matches_path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let matches = body_json(resp.into_body()).await;
+        assert!(!matches.as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduling REST endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn propose_confirm_decline_schedule() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "agent_id": "agent-alice",
+            "slot_start": "2026-02-20T14:00:00Z",
+            "slot_end": "2026-02-20T16:00:00Z"
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/schedules", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let slot = body_json(resp.into_body()).await;
+        let schedule_id = slot["schedule_id"].as_str().unwrap().to_string();
+        assert_eq!(slot["state"], "proposed");
+
+        let app = build_router(state.clone());
+        let confirm_path = format!("/v0/matchmaking/schedules/{}/confirm", schedule_id);
+        let resp = app.oneshot(post_empty(&confirm_path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let slot = body_json(resp.into_body()).await;
+        assert_eq!(slot["state"], "confirmed");
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/schedules", &body))
+            .await
+            .unwrap();
+        let slot2 = body_json(resp.into_body()).await;
+        let schedule_id2 = slot2["schedule_id"].as_str().unwrap().to_string();
+
+        let app = build_router(state);
+        let decline_path = format!("/v0/matchmaking/schedules/{}/decline", schedule_id2);
+        let resp = app.oneshot(post_empty(&decline_path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let slot = body_json(resp.into_body()).await;
+        assert_eq!(slot["state"], "declined");
+    }
+
+    #[tokio::test]
+    async fn list_schedules_with_agent_filter() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "agent_id": "agent-alice",
+            "slot_start": "2026-02-20T14:00:00Z",
+            "slot_end": "2026-02-20T16:00:00Z"
+        });
+        app.oneshot(post_json("/v0/matchmaking/schedules", &body))
+            .await
+            .unwrap();
+
+        let app = build_router(state.clone());
+        let resp = app.oneshot(get("/v0/matchmaking/schedules")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(get("/v0/matchmaking/schedules?agent_id=agent-alice"))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/matchmaking/schedules?agent_id=agent-nobody"))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Offer REST endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn submit_list_get_withdraw_offer() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "from_agent": "agent-alice",
+            "offer_id": "offer-1",
+            "summary": "Join my golf round",
+            "expires_at": "2030-12-31T23:59:59Z"
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/offers", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let offer = body_json(resp.into_body()).await;
+        assert_eq!(offer["offer_id"], "offer-1");
+        assert_eq!(offer["summary"], "Join my golf round");
+
+        let app = build_router(state.clone());
+        let resp = app.oneshot(get("/v0/matchmaking/offers")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(get("/v0/matchmaking/offers/offer-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["offer_id"], "offer-1");
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(post_empty("/v0/matchmaking/offers/offer-1/withdraw"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/matchmaking/offers")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_offer() {
+        let app = test_app();
+        let resp = app
+            .oneshot(get("/v0/matchmaking/offers/nope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end scenario: golf-sim workflow
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn e2e_golf_sim_workflow() {
+        let state = test_state();
+
+        // 1. Alice announces
+        let app = build_router(state.clone());
+        let announce = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({
+                "display_name": "Alice",
+                "supports": ["matchmaking"],
+                "status": "available"
+            }),
+        );
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &announce))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // 2. Create a room
+        let app = build_router(state.clone());
+        let create_room = serde_json::json!({
+            "room_id": "golf-lobby",
+            "name": "Golf Sim Lobby",
+            "max_members": 4
+        });
+        let resp = app
+            .oneshot(post_json("/v0/rooms", &create_room))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // 3. Alice joins the room
+        let app = build_router(state.clone());
+        let join = serde_json::json!({ "agent_id": "agent-alice" });
+        let resp = app
+            .oneshot(post_json("/v0/rooms/golf-lobby/join", &join))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 4. Set room state
+        let app = build_router(state.clone());
+        let set_state = serde_json::json!({
+            "agent_id": "agent-alice",
+            "key": "ready",
+            "value": true
+        });
+        let resp = app
+            .oneshot(post_json("/v0/rooms/golf-lobby/state", &set_state))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 5. Submit match request via REST
+        let app = build_router(state.clone());
+        let match_body = serde_json::json!({
+            "agent_id": "agent-alice",
+            "game": "golf-18",
+            "skill_range": { "min": 50.0, "max": 80.0 },
+            "time_window": {
+                "start": "2026-02-20T14:00:00Z",
+                "end": "2026-02-20T16:00:00Z"
+            }
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/requests", &match_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // 6. Propose a schedule
+        let app = build_router(state.clone());
+        let schedule = serde_json::json!({
+            "agent_id": "agent-alice",
+            "slot_start": "2026-02-20T14:00:00Z",
+            "slot_end": "2026-02-20T16:00:00Z"
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/schedules", &schedule))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let slot = body_json(resp.into_body()).await;
+        let schedule_id = slot["schedule_id"].as_str().unwrap().to_string();
+
+        // 7. Confirm the schedule
+        let app = build_router(state.clone());
+        let confirm_path = format!("/v0/matchmaking/schedules/{}/confirm", schedule_id);
+        let resp = app.oneshot(post_empty(&confirm_path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 8. Submit an offer
+        let app = build_router(state.clone());
+        let offer = serde_json::json!({
+            "from_agent": "agent-alice",
+            "offer_id": "offer-golf-1",
+            "summary": "18-hole round at Pebble Beach",
+            "expires_at": "2030-12-31T23:59:59Z"
+        });
+        let resp = app
+            .oneshot(post_json("/v0/matchmaking/offers", &offer))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // 9. Verify the full state
+        let app = build_router(state.clone());
+        let resp = app.oneshot(get("/v0/peers")).await.unwrap();
+        let peers = body_json(resp.into_body()).await;
+        assert_eq!(peers.as_array().unwrap().len(), 1);
+
+        let app = build_router(state.clone());
+        let resp = app.oneshot(get("/v0/rooms")).await.unwrap();
+        let rooms = body_json(resp.into_body()).await;
+        assert_eq!(rooms.as_array().unwrap().len(), 1);
+
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/matchmaking/offers")).await.unwrap();
+        let offers = body_json(resp.into_body()).await;
+        assert_eq!(offers.as_array().unwrap().len(), 1);
+        assert_eq!(offers[0]["summary"], "18-hole round at Pebble Beach");
     }
 }

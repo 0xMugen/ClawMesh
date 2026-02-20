@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::events::{Event, EventBus};
-use crate::signal::{SignalError, SignalMessage, signal_source, signal_target};
+use crate::signal::{signal_source, signal_target, SignalError, SignalMessage};
 
 /// A relay server that routes signaling messages between registered peers.
 ///
@@ -30,10 +30,7 @@ impl SignalRelay {
     /// If the peer was already registered, the old channel is replaced.
     pub async fn register(&self, agent_id: &str, buffer: usize) -> mpsc::Receiver<SignalMessage> {
         let (tx, rx) = mpsc::channel(buffer);
-        self.peers
-            .write()
-            .await
-            .insert(agent_id.to_string(), tx);
+        self.peers.write().await.insert(agent_id.to_string(), tx);
         tracing::info!(%agent_id, "peer registered with signal relay");
         rx
     }
@@ -58,9 +55,7 @@ impl SignalRelay {
             .get(&target)
             .ok_or_else(|| SignalError::UnknownPeer(target.clone()))?;
 
-        tx.send(msg)
-            .await
-            .map_err(|_| SignalError::ChannelClosed)?;
+        tx.send(msg).await.map_err(|_| SignalError::ChannelClosed)?;
 
         self.bus.emit(Event::SignalReceived {
             from: source,

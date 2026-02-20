@@ -146,9 +146,7 @@ mod tests {
         assert_eq!(node.registry().peer_count().await, 1);
 
         // Room works
-        node.rooms()
-            .create_room("room:lobby", "Lobby", None)
-            .await;
+        node.rooms().create_room("room:lobby", "Lobby", None).await;
         node.rooms()
             .join_room("room:lobby", "agent:alice")
             .await

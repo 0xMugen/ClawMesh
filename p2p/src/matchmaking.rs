@@ -250,8 +250,10 @@ impl Matchmaker {
         let result = slot.clone();
         drop(schedules);
 
-        self.bus
-            .emit_patch_ready(&self.mesh_id, &format!("schedule {} confirmed", schedule_id));
+        self.bus.emit_patch_ready(
+            &self.mesh_id,
+            &format!("schedule {} confirmed", schedule_id),
+        );
 
         Ok(result)
     }
@@ -426,11 +428,21 @@ mod tests {
         let mm = make_matchmaker();
 
         let req_a = mm
-            .submit_request("agent:alice", "golf-18", skill(50.0, 80.0), window_from_now(2))
+            .submit_request(
+                "agent:alice",
+                "golf-18",
+                skill(50.0, 80.0),
+                window_from_now(2),
+            )
             .await;
 
         let _req_b = mm
-            .submit_request("agent:bob", "golf-18", skill(60.0, 90.0), window_from_now(2))
+            .submit_request(
+                "agent:bob",
+                "golf-18",
+                skill(60.0, 90.0),
+                window_from_now(2),
+            )
             .await;
 
         let matches = mm.find_matches(&req_a.request_id).await.unwrap();
@@ -443,7 +455,12 @@ mod tests {
         let mm = make_matchmaker();
 
         let req_a = mm
-            .submit_request("agent:alice", "golf-18", skill(50.0, 80.0), window_from_now(2))
+            .submit_request(
+                "agent:alice",
+                "golf-18",
+                skill(50.0, 80.0),
+                window_from_now(2),
+            )
             .await;
 
         let _req_b = mm
@@ -459,11 +476,21 @@ mod tests {
         let mm = make_matchmaker();
 
         let req_a = mm
-            .submit_request("agent:alice", "golf-18", skill(10.0, 30.0), window_from_now(2))
+            .submit_request(
+                "agent:alice",
+                "golf-18",
+                skill(10.0, 30.0),
+                window_from_now(2),
+            )
             .await;
 
         let _req_b = mm
-            .submit_request("agent:bob", "golf-18", skill(60.0, 90.0), window_from_now(2))
+            .submit_request(
+                "agent:bob",
+                "golf-18",
+                skill(60.0, 90.0),
+                window_from_now(2),
+            )
             .await;
 
         let matches = mm.find_matches(&req_a.request_id).await.unwrap();
@@ -497,7 +524,12 @@ mod tests {
         let mm = make_matchmaker();
 
         let req = mm
-            .submit_request("agent:alice", "golf-18", skill(50.0, 80.0), window_from_now(2))
+            .submit_request(
+                "agent:alice",
+                "golf-18",
+                skill(50.0, 80.0),
+                window_from_now(2),
+            )
             .await;
 
         assert_eq!(mm.list_requests().await.len(), 1);
@@ -509,12 +541,22 @@ mod tests {
     async fn requests_for_game() {
         let mm = make_matchmaker();
 
-        mm.submit_request("agent:alice", "golf-18", skill(50.0, 80.0), window_from_now(2))
-            .await;
+        mm.submit_request(
+            "agent:alice",
+            "golf-18",
+            skill(50.0, 80.0),
+            window_from_now(2),
+        )
+        .await;
         mm.submit_request("agent:bob", "golf-9", skill(50.0, 80.0), window_from_now(2))
             .await;
-        mm.submit_request("agent:carol", "golf-18", skill(50.0, 80.0), window_from_now(2))
-            .await;
+        mm.submit_request(
+            "agent:carol",
+            "golf-18",
+            skill(50.0, 80.0),
+            window_from_now(2),
+        )
+        .await;
 
         let golf18 = mm.requests_for_game("golf-18").await;
         assert_eq!(golf18.len(), 2);
