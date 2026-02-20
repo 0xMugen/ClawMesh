@@ -6,6 +6,7 @@ use crate::crypto::PeerIdentity;
 use crate::discovery::MeshRegistry;
 use crate::events::EventBus;
 use crate::gossip::GossipRouter;
+use crate::matchmaking::Matchmaker;
 use crate::relay::SignalRelay;
 use crate::room::RoomManager;
 use crate::room_state::RoomStateSync;
@@ -13,9 +14,10 @@ use crate::room_state::RoomStateSync;
 /// A unified mesh participant that wires together all subsystems.
 ///
 /// `MeshNode` owns the identity, registry, authenticator, rooms, state sync,
-/// gossip router, signal relay, and event bus for a single node in the mesh.
-/// It provides a single entry point for higher-level code (e.g. the gateway)
-/// to interact with the mesh without manually threading shared state.
+/// gossip router, signal relay, matchmaker, and event bus for a single node
+/// in the mesh. It provides a single entry point for higher-level code
+/// (e.g. the gateway) to interact with the mesh without manually threading
+/// shared state.
 #[derive(Clone)]
 pub struct MeshNode {
     agent_id: String,
@@ -28,6 +30,7 @@ pub struct MeshNode {
     state: RoomStateSync,
     gossip: GossipRouter,
     relay: SignalRelay,
+    matchmaker: Matchmaker,
 }
 
 impl MeshNode {
@@ -46,6 +49,7 @@ impl MeshNode {
         let state = RoomStateSync::new(mesh_id, bus.clone());
         let gossip = GossipRouter::new(agent_id, registry.clone(), bus.clone());
         let relay = SignalRelay::new(bus.clone());
+        let matchmaker = Matchmaker::new(mesh_id, bus.clone());
 
         Self {
             agent_id: agent_id.to_string(),
@@ -58,6 +62,7 @@ impl MeshNode {
             state,
             gossip,
             relay,
+            matchmaker,
         }
     }
 
@@ -97,8 +102,17 @@ impl MeshNode {
         &self.relay
     }
 
+    pub fn matchmaker(&self) -> &Matchmaker {
+        &self.matchmaker
+    }
+
     pub fn public_key(&self) -> crate::crypto::PublicKeyBytes {
         self.identity.public_key()
+    }
+
+    /// Sign an arbitrary byte message with this node's identity.
+    pub fn sign(&self, message: &[u8]) -> crate::crypto::Signature {
+        self.identity.sign(message)
     }
 
     /// Spawn background gossip at the given interval.
@@ -111,6 +125,8 @@ impl MeshNode {
 mod tests {
     use super::*;
     use crate::discovery::{AnnounceMessage, PeerStatus};
+    use crate::matchmaking::{SkillRange, TimeWindow};
+    use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
 
     #[tokio::test]
@@ -151,6 +167,24 @@ mod tests {
         // Relay works
         let _rx = node.relay().register("agent:alice", 16).await;
         assert!(node.relay().is_registered("agent:alice").await);
+
+        // Matchmaker works
+        let req = node
+            .matchmaker()
+            .submit_request(
+                "agent:alice",
+                "golf-18",
+                SkillRange {
+                    min: 50.0,
+                    max: 80.0,
+                },
+                TimeWindow {
+                    start: Utc::now(),
+                    end: Utc::now() + ChronoDuration::hours(2),
+                },
+            )
+            .await;
+        assert!(!req.request_id.is_empty());
     }
 
     #[test]
@@ -159,5 +193,16 @@ mod tests {
         assert_eq!(node.agent_id(), "agent:alice");
         assert_eq!(node.mesh_id(), "mesh:golf-sim");
         assert!(!node.public_key().key.is_empty());
+    }
+
+    #[test]
+    fn node_sign() {
+        let node = MeshNode::new("agent:alice", "mesh:test").unwrap();
+        let sig = node.sign(b"hello mesh");
+        assert!(!sig.sig.is_empty());
+
+        // Verify with node's own public key
+        let pk = node.public_key();
+        crate::crypto::verify(&pk, b"hello mesh", &sig).unwrap();
     }
 }
