@@ -25,6 +25,18 @@ pub enum Event {
         agent_id: String,
         room_id: String,
     },
+    PeerAuthenticated {
+        agent_id: String,
+        mesh_id: String,
+    },
+    PeerAuthFailed {
+        agent_id: String,
+        reason: String,
+    },
+    ChannelEstablished {
+        from: String,
+        to: String,
+    },
     PatchReady {
         mesh_id: String,
         description: String,
