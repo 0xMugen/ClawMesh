@@ -37,6 +37,11 @@ pub enum Event {
         from: String,
         to: String,
     },
+    RoomStateChanged {
+        room_id: String,
+        key: String,
+        author: String,
+    },
     PatchReady {
         mesh_id: String,
         description: String,
