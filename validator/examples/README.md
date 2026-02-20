@@ -10,3 +10,9 @@ Quick check:
 ```bash
 python validator/validate.py schemas/examples/announce.valid.json
 ```
+
+Validate all current fixtures:
+
+```bash
+python validator/validate.py schemas/examples/*.json spec/examples/*.json
+```

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 try:
-    from jsonschema import Draft202012Validator
+    from jsonschema import Draft202012Validator, FormatChecker
 except ImportError:
     print("error: missing dependency 'jsonschema' (pip install jsonschema)", file=sys.stderr)
     sys.exit(2)
@@ -23,7 +23,7 @@ def _load_json(path: Path) -> dict:
         return json.load(f)
 
 
-def _validate(path: Path, envelope_validator: Draft202012Validator) -> list[str]:
+def _validate(path: Path, envelope_validator: Draft202012Validator, format_checker: FormatChecker) -> list[str]:
     errors: list[str] = []
     try:
         data = _load_json(path)
@@ -45,7 +45,7 @@ def _validate(path: Path, envelope_validator: Draft202012Validator) -> list[str]
         return errors
 
     payload_schema = _load_json(payload_schema_path)
-    payload_validator = Draft202012Validator(payload_schema)
+    payload_validator = Draft202012Validator(payload_schema, format_checker=format_checker)
     payload = data.get("payload", {})
 
     for err in payload_validator.iter_errors(payload):
@@ -61,11 +61,12 @@ def main(argv: list[str]) -> int:
         return 2
 
     envelope_schema = _load_json(ENVELOPE_SCHEMA_PATH)
-    envelope_validator = Draft202012Validator(envelope_schema)
+    format_checker = FormatChecker()
+    envelope_validator = Draft202012Validator(envelope_schema, format_checker=format_checker)
 
     all_errors: list[str] = []
     for raw_path in argv[1:]:
-        all_errors.extend(_validate(Path(raw_path), envelope_validator))
+        all_errors.extend(_validate(Path(raw_path), envelope_validator, format_checker))
 
     if all_errors:
         for line in all_errors:

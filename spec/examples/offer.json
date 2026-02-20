@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.1",
+  "intent": "offer",
+  "capability": "matchmaking",
+  "policy": "private",
+  "timestamp": "2026-02-20T12:03:00Z",
+  "sender": {
+    "agent_id": "agent:dana",
+    "mesh_id": "mesh:golf-sim"
+  },
+  "payload": {
+    "offer_id": "offer:welcome-round",
+    "summary": "First match bonus slot with priority pairing.",
+    "expires_at": "2026-02-22T00:00:00Z"
+  }
+}

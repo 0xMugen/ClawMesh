@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.1",
+  "intent": "schedule",
+  "capability": "matchmaking",
+  "policy": "mesh-only",
+  "timestamp": "2026-02-20T12:02:00Z",
+  "sender": {
+    "agent_id": "agent:carol",
+    "mesh_id": "mesh:golf-sim"
+  },
+  "payload": {
+    "slot_start": "2026-02-21T19:00:00Z",
+    "slot_end": "2026-02-21T20:00:00Z",
+    "state": "confirmed"
+  }
+}
