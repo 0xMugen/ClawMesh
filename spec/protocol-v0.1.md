@@ -30,6 +30,12 @@ Every message MUST use this top-level envelope:
 - `sender.mesh_id`: mesh/network ID.
 - `payload`: intent-specific object.
 
+### Optional fields
+
+- `signature`: base64-encoded Ed25519 signature over the canonical JSON payload.
+- `signing_key`: base64-encoded Ed25519 public key of the signer.
+- `expiry`: RFC 3339 UTC timestamp. Envelopes past this time MUST be rejected (HTTP 410 GONE).
+
 ## Intents
 
 - `announce`: advertise presence and capabilities.

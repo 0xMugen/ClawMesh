@@ -8,9 +8,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use clawmesh_p2p::{
-    AnnounceMessage, FederationEnvelope, GossipMessage, MatchRequest, MeshLink, MeshNode,
-    PeerEntry, PeerOffer, PeerQuery, PeerStatus, RoomInfo, ScheduleSlot, SignalMessage, SkillRange,
-    StateDelta, StateEntry, StateSnapshot, TimeWindow,
+    AnnounceMessage, AuthChallenge, AuthHello, AuthResponse, FederationEnvelope, GossipMessage,
+    MatchRequest, MeshLink, MeshNode, PeerEntry, PeerOffer, PeerQuery, PeerStatus, RoomInfo,
+    ScheduleSlot, SignalMessage, SkillRange, StateDelta, StateEntry, StateSnapshot, TimeWindow,
 };
 use opentelemetry::{global, trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
@@ -41,6 +41,12 @@ struct Envelope {
     /// Optional Ed25519 signature over the canonical JSON payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    /// Optional Ed25519 public key of the signer (base64-encoded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signing_key: Option<String>,
+    /// Optional expiry timestamp — envelopes past this time are rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiry: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -177,6 +183,12 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/v0/federation/relay", post(federation_relay))
         .route("/v0/federation/status", get(federation_status))
+        // Auth handshake
+        .route("/v0/auth/hello", post(auth_hello))
+        .route("/v0/auth/respond", post(auth_respond))
+        .route("/v0/auth/peers", get(list_authenticated_peers))
+        // Maintenance
+        .route("/v0/maintenance/purge", post(purge_expired))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -565,6 +577,24 @@ async fn route_envelope(
                 detail,
             }),
         ));
+    }
+
+    // Reject expired envelopes.
+    if let Some(expiry) = envelope.expiry {
+        if expiry < Utc::now() {
+            let detail = format!(
+                "envelope expired at {}",
+                expiry.to_rfc3339()
+            );
+            warn!(%detail, "expired envelope rejected");
+            return Err((
+                StatusCode::GONE,
+                Json(ErrorResponse {
+                    error: "envelope_expired",
+                    detail,
+                }),
+            ));
+        }
     }
 
     // Enforce policy before dispatching.
@@ -1524,6 +1554,105 @@ async fn federation_relay(
     // already enforced policy. We trust the federation link.
     let response = dispatch_intent(&state, &envelope).await;
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+// ---------------------------------------------------------------------------
+// Auth handshake endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /v0/auth/hello — Initiate a mutual authentication handshake.
+///
+/// The caller sends an `AuthHello` containing their agent_id and public key.
+/// The gateway responds with an `AuthChallenge` containing a random nonce.
+#[instrument(skip(state, body))]
+async fn auth_hello(
+    State(state): State<AppState>,
+    Json(body): Json<AuthHello>,
+) -> Result<Json<AuthChallenge>, (StatusCode, Json<ErrorResponse>)> {
+    let challenge = state.node.auth().handle_hello(body).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "auth_error",
+                detail: e.to_string(),
+            }),
+        )
+    })?;
+    info!(agent_id = %challenge.agent_id, "auth challenge issued");
+    Ok(Json(challenge))
+}
+
+/// POST /v0/auth/respond — Complete the authentication handshake.
+///
+/// The caller sends an `AuthResponse` (their signature over the challenge nonce)
+/// along with the public key they originally sent in the hello.
+#[derive(Debug, Deserialize)]
+struct AuthRespondRequest {
+    response: AuthResponse,
+    public_key: clawmesh_p2p::PublicKeyBytes,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthRespondResult {
+    status: &'static str,
+    agent_id: String,
+}
+
+#[instrument(skip(state, body))]
+async fn auth_respond(
+    State(state): State<AppState>,
+    Json(body): Json<AuthRespondRequest>,
+) -> Result<Json<AuthRespondResult>, (StatusCode, Json<ErrorResponse>)> {
+    let agent_id = body.response.agent_id.clone();
+    let confirm = state
+        .node
+        .auth()
+        .handle_response(body.response, &body.public_key)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                clawmesh_p2p::AuthError::VerificationFailed => StatusCode::UNAUTHORIZED,
+                clawmesh_p2p::AuthError::NoPendingChallenge(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: "auth_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })?;
+
+    info!(agent_id = %confirm.agent_id, peer = %agent_id, "peer authenticated");
+
+    Ok(Json(AuthRespondResult {
+        status: "authenticated",
+        agent_id,
+    }))
+}
+
+/// GET /v0/auth/peers — List all authenticated peers.
+async fn list_authenticated_peers(State(state): State<AppState>) -> Json<Vec<String>> {
+    let peers = state.node.auth().authenticated_peers().await;
+    Json(peers.into_iter().map(|p| p.agent_id).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct PurgeResponse {
+    status: &'static str,
+}
+
+/// POST /v0/maintenance/purge — Purge expired match requests and offers.
+#[instrument(skip(state))]
+async fn purge_expired(State(state): State<AppState>) -> Json<PurgeResponse> {
+    state.node.matchmaker().purge_expired().await;
+    info!("purge of expired entries completed");
+    Json(PurgeResponse { status: "ok" })
 }
 
 async fn shutdown_signal() {
@@ -2730,5 +2859,153 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["error"], "federation_unlink_error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Envelope expiry
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn expired_envelope_rejected() {
+        let app = test_app();
+        let mut envelope = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        envelope["expiry"] = serde_json::json!("2020-01-01T00:00:00Z");
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "envelope_expired");
+    }
+
+    #[tokio::test]
+    async fn future_expiry_accepted() {
+        let app = test_app();
+        let mut envelope = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        envelope["expiry"] = serde_json::json!("2030-12-31T23:59:59Z");
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn no_expiry_accepted() {
+        let app = test_app();
+        let envelope = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({ "display_name": "X", "supports": [], "status": "available" }),
+        );
+        // No expiry field at all — should be accepted
+        let resp = app
+            .oneshot(post_json("/v0/envelope", &envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth handshake
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn auth_hello_returns_challenge() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let identity = clawmesh_p2p::crypto::PeerIdentity::generate().unwrap();
+        let hello = serde_json::json!({
+            "agent_id": "agent:carol",
+            "public_key": { "key": identity.public_key().key }
+        });
+
+        let resp = app
+            .oneshot(post_json("/v0/auth/hello", &hello))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert!(body["nonce"].is_string());
+        assert!(!body["nonce"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auth_full_handshake() {
+        let state = test_state();
+
+        let identity = clawmesh_p2p::crypto::PeerIdentity::generate().unwrap();
+        let public_key = identity.public_key();
+
+        // Step 1: Hello
+        let app = build_router(state.clone());
+        let hello = serde_json::json!({
+            "agent_id": "agent:dave",
+            "public_key": { "key": public_key.key }
+        });
+        let resp = app
+            .oneshot(post_json("/v0/auth/hello", &hello))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let challenge_body = body_json(resp.into_body()).await;
+        let nonce = challenge_body["nonce"].as_str().unwrap();
+
+        // Step 2: Sign the challenge
+        let nonce_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            nonce,
+        )
+        .unwrap();
+        let sig = identity.sign(&nonce_bytes);
+
+        // Step 3: Respond
+        let app = build_router(state.clone());
+        let respond = serde_json::json!({
+            "response": {
+                "agent_id": "agent:dave",
+                "signature": { "sig": sig.sig }
+            },
+            "public_key": { "key": public_key.key }
+        });
+        let resp = app
+            .oneshot(post_json("/v0/auth/respond", &respond))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "authenticated");
+        assert_eq!(body["agent_id"], "agent:dave");
+
+        // Step 4: Verify the peer appears in authenticated peers list
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/auth/peers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let peers = body.as_array().unwrap();
+        assert!(peers.iter().any(|p| p == "agent:dave"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Maintenance — purge expired
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn purge_expired_returns_ok() {
+        let app = test_app();
+        let resp = app.oneshot(post_empty("/v0/maintenance/purge")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "ok");
     }
 }

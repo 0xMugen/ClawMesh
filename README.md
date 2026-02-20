@@ -45,8 +45,12 @@ nix develop
 ### Gateway (`gateway`)
 - Axum-based HTTP API serving the mesh protocol.
 - Envelope routing with policy enforcement and signature verification.
+- Envelope expiry validation (reject expired envelopes with HTTP 410 GONE).
 - REST endpoints for peers, rooms, state, matchmaking, schedules, offers, and federation.
+- Auth handshake endpoints (mutual challenge-response authentication).
 - Federation endpoints for cross-mesh link management and envelope relay.
+- Gossip exchange endpoint for cross-node peer discovery.
+- Maintenance endpoint for purging expired requests and offers.
 - OpenTelemetry tracing integration.
 
 ### Validator (`validator`)

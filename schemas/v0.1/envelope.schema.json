@@ -49,6 +49,19 @@
     },
     "payload": {
       "type": "object"
+    },
+    "signature": {
+      "type": "string",
+      "description": "Optional Ed25519 signature over the canonical JSON payload (base64-encoded)."
+    },
+    "signing_key": {
+      "type": "string",
+      "description": "Optional base64-encoded Ed25519 public key of the signer."
+    },
+    "expiry": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Optional RFC 3339 timestamp after which the envelope is no longer valid."
     }
   },
   "additionalProperties": false

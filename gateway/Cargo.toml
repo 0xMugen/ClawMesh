@@ -19,6 +19,7 @@ tracing-opentelemetry = "0.25"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+base64 = "0.22"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
