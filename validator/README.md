@@ -1,31 +1,40 @@
-# Validator (Bootstrap)
+# Validator (TypeScript/Node)
 
-Minimal CLI validator for ClawMesh `v0.1` messages.
+TypeScript/Node validator package for ClawMesh `v0.1` messages.
 
-## Requirements
-
-- Python 3.10+
-- `jsonschema` package
-
-Install dependency:
+## Install
 
 ```bash
-pip install jsonschema
+cd validator
+npm install
 ```
 
-## Usage
+## Build
 
 ```bash
-python validator/validate.py schemas/examples/announce.valid.json
+npm run build
+```
+
+## CLI usage
+
+```bash
+npm run build
+node dist/src/cli.js schemas/examples/announce.valid.json
 ```
 
 Validate multiple files:
 
 ```bash
-python validator/validate.py spec/examples/*.json
+node dist/src/cli.js spec/examples/*.json
 ```
 
 The validator applies:
 
 1. Envelope validation (`schemas/v0.1/envelope.schema.json`)
 2. Payload validation (`schemas/v0.1/messages/<intent>.schema.json`)
+
+## Tests
+
+```bash
+npm test
+```

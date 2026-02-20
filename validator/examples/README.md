@@ -8,11 +8,11 @@ Use sample protocol documents from:
 Quick check:
 
 ```bash
-python validator/validate.py schemas/examples/announce.valid.json
+node validator/dist/src/cli.js schemas/examples/announce.valid.json
 ```
 
 Validate all current fixtures:
 
 ```bash
-python validator/validate.py schemas/examples/*.json spec/examples/*.json
+node validator/dist/src/cli.js schemas/examples/*.json spec/examples/*.json
 ```
