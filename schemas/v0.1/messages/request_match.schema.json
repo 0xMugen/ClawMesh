@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawmesh.dev/schemas/v0.1/messages/request_match.schema.json",
+  "title": "request_match payload",
+  "type": "object",
+  "required": ["game", "skill_range", "time_window"],
+  "properties": {
+    "game": {
+      "type": "string",
+      "minLength": 1
+    },
+    "skill_range": {
+      "type": "object",
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "number" },
+        "max": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "time_window": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

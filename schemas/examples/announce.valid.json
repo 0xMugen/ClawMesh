@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.1",
+  "intent": "announce",
+  "capability": "matchmaking",
+  "policy": "mesh-only",
+  "timestamp": "2026-02-20T12:00:00Z",
+  "sender": {
+    "agent_id": "agent:alice",
+    "mesh_id": "mesh:golf-sim"
+  },
+  "payload": {
+    "display_name": "Alice",
+    "supports": ["announce", "request_match"],
+    "status": "available"
+  }
+}

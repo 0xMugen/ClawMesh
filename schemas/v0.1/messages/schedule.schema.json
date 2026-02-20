@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawmesh.dev/schemas/v0.1/messages/schedule.schema.json",
+  "title": "schedule payload",
+  "type": "object",
+  "required": ["slot_start", "slot_end", "state"],
+  "properties": {
+    "slot_start": { "type": "string", "format": "date-time" },
+    "slot_end": { "type": "string", "format": "date-time" },
+    "state": {
+      "type": "string",
+      "enum": ["proposed", "confirmed", "declined"]
+    }
+  },
+  "additionalProperties": false
+}

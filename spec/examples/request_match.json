@@ -1,0 +1,22 @@
+{
+  "schema_version": "0.1",
+  "intent": "request_match",
+  "capability": "matchmaking",
+  "policy": "mesh-only",
+  "timestamp": "2026-02-20T12:01:00Z",
+  "sender": {
+    "agent_id": "agent:bob",
+    "mesh_id": "mesh:golf-sim"
+  },
+  "payload": {
+    "game": "golf-sim",
+    "skill_range": {
+      "min": 8,
+      "max": 18
+    },
+    "time_window": {
+      "start": "2026-02-21T18:00:00Z",
+      "end": "2026-02-21T22:00:00Z"
+    }
+  }
+}

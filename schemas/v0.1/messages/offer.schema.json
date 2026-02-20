@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawmesh.dev/schemas/v0.1/messages/offer.schema.json",
+  "title": "offer payload",
+  "type": "object",
+  "required": ["offer_id", "summary", "expires_at"],
+  "properties": {
+    "offer_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

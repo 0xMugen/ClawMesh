@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawmesh.dev/schemas/v0.1/envelope.schema.json",
+  "title": "ClawMesh Envelope v0.1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "intent",
+    "capability",
+    "policy",
+    "timestamp",
+    "sender",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "intent": {
+      "type": "string",
+      "enum": ["announce", "request_match", "schedule", "offer"]
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1
+    },
+    "policy": {
+      "type": "string",
+      "enum": ["public", "mesh-only", "private"]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sender": {
+      "type": "object",
+      "required": ["agent_id", "mesh_id"],
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agent:[A-Za-z0-9_.-]+$"
+        },
+        "mesh_id": {
+          "type": "string",
+          "pattern": "^mesh:[A-Za-z0-9_.-]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}
