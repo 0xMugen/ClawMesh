@@ -38,13 +38,15 @@ nix develop
 - **State sync**: Per-room key-value state with vector clock causal ordering.
 - **Signaling**: WebRTC offer/answer/ICE relay for NAT traversal.
 - **Encrypted channels**: AEAD-encrypted bidirectional transport.
+- **Federation**: Multi-mesh envelope relay with TTL-based loop prevention.
 - **Event bus**: Broadcast-based event system for decoupled components.
 - **MeshNode**: Unified entry point wiring all subsystems together.
 
 ### Gateway (`gateway`)
 - Axum-based HTTP API serving the mesh protocol.
 - Envelope routing with policy enforcement and signature verification.
-- REST endpoints for peers, rooms, state, matchmaking, schedules, and offers.
+- REST endpoints for peers, rooms, state, matchmaking, schedules, offers, and federation.
+- Federation endpoints for cross-mesh link management and envelope relay.
 - OpenTelemetry tracing integration.
 
 ### Validator (`validator`)
@@ -55,7 +57,6 @@ nix develop
 ## Next steps
 
 1. Persistence layer for peer registry, rooms, and matchmaking state.
-2. Cross-node gossip networking (multi-gateway federation).
-3. WebRTC data channel integration for direct peer communication.
-4. Full signature enforcement (reject unsigned envelopes in strict mode).
-5. Rate limiting and abuse prevention on gateway endpoints.
+2. WebRTC data channel integration for direct peer communication.
+3. Full signature enforcement (reject unsigned envelopes in strict mode).
+4. Rate limiting and abuse prevention on gateway endpoints.

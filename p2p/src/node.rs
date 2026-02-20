@@ -5,6 +5,7 @@ use crate::auth::PeerAuthenticator;
 use crate::crypto::PeerIdentity;
 use crate::discovery::MeshRegistry;
 use crate::events::EventBus;
+use crate::federation::FederationRouter;
 use crate::gossip::GossipRouter;
 use crate::matchmaking::Matchmaker;
 use crate::relay::SignalRelay;
@@ -14,10 +15,10 @@ use crate::room_state::RoomStateSync;
 /// A unified mesh participant that wires together all subsystems.
 ///
 /// `MeshNode` owns the identity, registry, authenticator, rooms, state sync,
-/// gossip router, signal relay, matchmaker, and event bus for a single node
-/// in the mesh. It provides a single entry point for higher-level code
-/// (e.g. the gateway) to interact with the mesh without manually threading
-/// shared state.
+/// gossip router, signal relay, matchmaker, federation router, and event bus
+/// for a single node in the mesh. It provides a single entry point for
+/// higher-level code (e.g. the gateway) to interact with the mesh without
+/// manually threading shared state.
 #[derive(Clone)]
 pub struct MeshNode {
     agent_id: String,
@@ -31,6 +32,7 @@ pub struct MeshNode {
     gossip: GossipRouter,
     relay: SignalRelay,
     matchmaker: Matchmaker,
+    federation: FederationRouter,
 }
 
 impl MeshNode {
@@ -50,6 +52,7 @@ impl MeshNode {
         let gossip = GossipRouter::new(agent_id, registry.clone(), bus.clone());
         let relay = SignalRelay::new(bus.clone());
         let matchmaker = Matchmaker::new(mesh_id, bus.clone());
+        let federation = FederationRouter::new(mesh_id, bus.clone());
 
         Self {
             agent_id: agent_id.to_string(),
@@ -63,6 +66,7 @@ impl MeshNode {
             gossip,
             relay,
             matchmaker,
+            federation,
         }
     }
 
@@ -104,6 +108,10 @@ impl MeshNode {
 
     pub fn matchmaker(&self) -> &Matchmaker {
         &self.matchmaker
+    }
+
+    pub fn federation(&self) -> &FederationRouter {
+        &self.federation
     }
 
     pub fn public_key(&self) -> crate::crypto::PublicKeyBytes {

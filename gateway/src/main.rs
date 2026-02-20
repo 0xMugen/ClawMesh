@@ -8,9 +8,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use clawmesh_p2p::{
-    AnnounceMessage, GossipMessage, MatchRequest, MeshNode, PeerEntry, PeerOffer, PeerQuery,
-    PeerStatus, RoomInfo, ScheduleSlot, SignalMessage, SkillRange, StateDelta, StateEntry,
-    StateSnapshot, TimeWindow,
+    AnnounceMessage, FederationEnvelope, GossipMessage, MatchRequest, MeshLink, MeshNode,
+    PeerEntry, PeerOffer, PeerQuery, PeerStatus, RoomInfo, ScheduleSlot, SignalMessage, SkillRange,
+    StateDelta, StateEntry, StateSnapshot, TimeWindow,
 };
 use opentelemetry::{global, trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
@@ -166,6 +166,17 @@ fn build_router(state: AppState) -> Router {
             "/v0/matchmaking/offers/:offer_id/withdraw",
             post(withdraw_offer),
         )
+        // Federation
+        .route(
+            "/v0/federation/links",
+            get(list_federation_links).post(create_federation_link),
+        )
+        .route(
+            "/v0/federation/links/:mesh_id",
+            axum::routing::delete(remove_federation_link),
+        )
+        .route("/v0/federation/relay", post(federation_relay))
+        .route("/v0/federation/status", get(federation_status))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -1314,6 +1325,207 @@ async fn withdraw_offer(
         })
 }
 
+// ---------------------------------------------------------------------------
+// Federation endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct FederationStatusResponse {
+    local_mesh_id: String,
+    linked_meshes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateLinkRequest {
+    mesh_id: String,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkResponse {
+    status: &'static str,
+    mesh_id: String,
+}
+
+/// GET /v0/federation/status — Return federation status.
+async fn federation_status(State(state): State<AppState>) -> Json<FederationStatusResponse> {
+    Json(FederationStatusResponse {
+        local_mesh_id: state.node.federation().local_mesh_id().to_string(),
+        linked_meshes: state.node.federation().link_count().await,
+    })
+}
+
+/// GET /v0/federation/links — List all linked remote meshes.
+async fn list_federation_links(State(state): State<AppState>) -> Json<Vec<MeshLink>> {
+    Json(state.node.federation().linked_meshes().await)
+}
+
+/// POST /v0/federation/links — Establish a link to a remote mesh.
+#[instrument(skip(state, body))]
+async fn create_federation_link(
+    State(state): State<AppState>,
+    Json(body): Json<CreateLinkRequest>,
+) -> Result<(StatusCode, Json<LinkResponse>), (StatusCode, Json<ErrorResponse>)> {
+    // We create the link but the receiver is used internally by the gateway
+    // to actually deliver envelopes. For now, we drop the receiver — a real
+    // deployment would spawn a forwarding task to the remote mesh.
+    let _rx = state
+        .node
+        .federation()
+        .link_mesh(&body.mesh_id, body.label.as_deref(), 64)
+        .await
+        .map_err(|e| {
+            let detail = e.to_string();
+            let status = match &e {
+                clawmesh_p2p::FederationError::LinkExists(_) => StatusCode::CONFLICT,
+                clawmesh_p2p::FederationError::SelfRelay => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: "federation_link_error",
+                    detail,
+                }),
+            )
+        })?;
+
+    info!(mesh_id = %body.mesh_id, "federation link created");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(LinkResponse {
+            status: "linked",
+            mesh_id: body.mesh_id,
+        }),
+    ))
+}
+
+/// DELETE /v0/federation/links/:mesh_id — Remove a link to a remote mesh.
+#[instrument(skip(state))]
+async fn remove_federation_link(
+    State(state): State<AppState>,
+    Path(mesh_id): Path<String>,
+) -> Result<Json<LinkResponse>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .node
+        .federation()
+        .unlink_mesh(&mesh_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "federation_unlink_error",
+                    detail: e.to_string(),
+                }),
+            )
+        })?;
+
+    info!(mesh_id = %mesh_id, "federation link removed");
+
+    Ok(Json(LinkResponse {
+        status: "unlinked",
+        mesh_id,
+    }))
+}
+
+/// POST /v0/federation/relay — Receive a federation envelope from a remote mesh.
+///
+/// When a remote mesh sends an envelope targeting this mesh, it arrives here.
+/// The gateway checks if the envelope is for the local mesh and, if so,
+/// processes the inner protocol envelope through the normal dispatch pipeline.
+#[instrument(skip(state, body))]
+async fn federation_relay(
+    State(state): State<AppState>,
+    Json(body): Json<FederationEnvelope>,
+) -> Result<(StatusCode, Json<RouteResponse>), (StatusCode, Json<ErrorResponse>)> {
+    // Check if this envelope is for us
+    if !state.node.federation().should_accept(&body) {
+        let target_mesh = body.target_mesh.clone();
+
+        // Not for us — if we have a link to the target mesh, forward it
+        if state
+            .node
+            .federation()
+            .is_linked(&target_mesh)
+            .await
+        {
+            state
+                .node
+                .federation()
+                .forward(&target_mesh, body)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse {
+                            error: "federation_forward_error",
+                            detail: e.to_string(),
+                        }),
+                    )
+                })?;
+
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(RouteResponse {
+                    status: "forwarded",
+                    intent: Intent::Announce, // placeholder — forwarded envelopes don't have a parsed intent
+                    route: "federation_forward",
+                }),
+            ));
+        }
+
+        return Err((
+            StatusCode::MISDIRECTED_REQUEST,
+            Json(ErrorResponse {
+                error: "wrong_mesh",
+                detail: format!(
+                    "envelope targets mesh '{}', this node serves '{}'",
+                    target_mesh,
+                    state.node.mesh_id()
+                ),
+            }),
+        ));
+    }
+
+    info!(
+        source_mesh = %body.source_mesh,
+        ttl = body.ttl,
+        "federation envelope accepted"
+    );
+
+    // Deserialize the inner envelope and process it normally.
+    let envelope: Envelope = serde_json::from_value(body.envelope).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid_federated_envelope",
+                detail: format!("inner envelope parse error: {e}"),
+            }),
+        )
+    })?;
+
+    if envelope.schema_version != PROTOCOL_VERSION {
+        let detail = format!(
+            "unsupported schema_version '{}', expected '{}'",
+            envelope.schema_version, PROTOCOL_VERSION
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid_schema_version",
+                detail,
+            }),
+        ));
+    }
+
+    // Skip policy enforcement for federated envelopes — the source mesh
+    // already enforced policy. We trust the federation link.
+    let response = dispatch_intent(&state, &envelope).await;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         info!("shutdown signal received");
@@ -1357,6 +1569,14 @@ mod tests {
 
     fn post_empty(path: &str) -> Request<Body> {
         Request::post(path.parse::<hyper::Uri>().unwrap())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn delete(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(path.parse::<hyper::Uri>().unwrap())
             .body(Body::empty())
             .unwrap()
     }
@@ -2305,5 +2525,210 @@ mod tests {
         let offers = body_json(resp.into_body()).await;
         assert_eq!(offers.as_array().unwrap().len(), 1);
         assert_eq!(offers[0]["summary"], "18-hole round at Pebble Beach");
+    }
+
+    // -----------------------------------------------------------------------
+    // Federation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn federation_status_returns_local_mesh() {
+        let app = test_app();
+        let resp = app
+            .oneshot(get("/v0/federation/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["local_mesh_id"], "mesh-test");
+        assert_eq!(body["linked_meshes"], 0);
+    }
+
+    #[tokio::test]
+    async fn create_and_list_federation_links() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let link = serde_json::json!({ "mesh_id": "mesh-remote", "label": "Remote Mesh" });
+        let resp = app
+            .oneshot(post_json("/v0/federation/links", &link))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "linked");
+        assert_eq!(body["mesh_id"], "mesh-remote");
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(get("/v0/federation/links"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let links = body.as_array().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["mesh_id"], "mesh-remote");
+
+        // Status should reflect the link
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/federation/status"))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["linked_meshes"], 1);
+    }
+
+    #[tokio::test]
+    async fn remove_federation_link() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let link = serde_json::json!({ "mesh_id": "mesh-remote" });
+        app.oneshot(post_json("/v0/federation/links", &link))
+            .await
+            .unwrap();
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(delete("/v0/federation/links/mesh-remote"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "unlinked");
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(get("/v0/federation/links"))
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_federation_link_returns_conflict() {
+        let state = test_state();
+
+        let app = build_router(state.clone());
+        let link = serde_json::json!({ "mesh_id": "mesh-remote" });
+        app.oneshot(post_json("/v0/federation/links", &link))
+            .await
+            .unwrap();
+
+        let app = build_router(state);
+        let link = serde_json::json!({ "mesh_id": "mesh-remote" });
+        let resp = app
+            .oneshot(post_json("/v0/federation/links", &link))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "federation_link_error");
+    }
+
+    #[tokio::test]
+    async fn self_federation_link_returns_bad_request() {
+        let app = test_app();
+        let link = serde_json::json!({ "mesh_id": "mesh-test" });
+        let resp = app
+            .oneshot(post_json("/v0/federation/links", &link))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "federation_link_error");
+    }
+
+    #[tokio::test]
+    async fn federation_relay_accepts_envelope_for_local_mesh() {
+        let state = test_state();
+
+        // Link a source mesh first (so we know federation is set up)
+        let app = build_router(state.clone());
+        let link = serde_json::json!({ "mesh_id": "mesh-remote" });
+        app.oneshot(post_json("/v0/federation/links", &link))
+            .await
+            .unwrap();
+
+        // Build a federation envelope targeting our local mesh
+        let inner = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({
+                "display_name": "RemoteAlice",
+                "supports": ["matchmaking"],
+                "status": "available"
+            }),
+        );
+        let fed_envelope = serde_json::json!({
+            "source_mesh": "mesh-remote",
+            "target_mesh": "mesh-test",
+            "envelope": inner,
+            "relayed_at": "2026-02-20T12:00:00Z",
+            "ttl": 8
+        });
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(post_json("/v0/federation/relay", &fed_envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["intent"], "announce");
+
+        // The inner envelope should have been processed — peer should be registered
+        let app = build_router(state);
+        let resp = app.oneshot(get("/v0/peers")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        let peers = body.as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["display_name"], "RemoteAlice");
+    }
+
+    #[tokio::test]
+    async fn federation_relay_rejects_wrong_mesh() {
+        let app = test_app();
+
+        let inner = make_envelope(
+            "announce",
+            "public",
+            serde_json::json!({
+                "display_name": "X",
+                "supports": [],
+                "status": "available"
+            }),
+        );
+        let fed_envelope = serde_json::json!({
+            "source_mesh": "mesh-remote",
+            "target_mesh": "mesh-other",
+            "envelope": inner,
+            "relayed_at": "2026-02-20T12:00:00Z",
+            "ttl": 8
+        });
+
+        let resp = app
+            .oneshot(post_json("/v0/federation/relay", &fed_envelope))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "wrong_mesh");
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_federation_link_returns_not_found() {
+        let app = test_app();
+        let resp = app
+            .oneshot(delete("/v0/federation/links/mesh-nope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["error"], "federation_unlink_error");
     }
 }

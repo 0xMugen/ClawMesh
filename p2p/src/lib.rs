@@ -3,6 +3,7 @@ pub mod channel;
 pub mod crypto;
 pub mod discovery;
 pub mod events;
+pub mod federation;
 pub mod gossip;
 pub mod matchmaking;
 pub mod node;
@@ -16,6 +17,7 @@ pub use channel::{ChannelError, EncryptedChannel};
 pub use crypto::{CryptoError, PeerIdentity, PublicKeyBytes, Signature};
 pub use discovery::{AnnounceMessage, MeshRegistry, PeerEntry, PeerQuery, PeerStatus};
 pub use events::{Event, EventBus};
+pub use federation::{FederationEnvelope, FederationError, FederationRouter, MeshLink};
 pub use gossip::{GossipError, GossipMessage, GossipRouter};
 pub use matchmaking::{
     MatchError, MatchRequest, MatchResult, Matchmaker, PeerOffer, ScheduleSlot, SkillRange,
