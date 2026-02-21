@@ -318,14 +318,18 @@ name = "gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "clawmesh-p2p",
+ "http-body-util",
+ "hyper",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde",
  "serde_json",
  "tokio",
+ "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",

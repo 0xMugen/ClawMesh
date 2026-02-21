@@ -57,10 +57,10 @@ impl GossipRouter {
         buffer: usize,
     ) -> mpsc::Receiver<GossipMessage> {
         let (tx, rx) = mpsc::channel(buffer);
-        self.peers.write().await.insert(
-            peer_node_id.to_string(),
-            GossipPeer { tx },
-        );
+        self.peers
+            .write()
+            .await
+            .insert(peer_node_id.to_string(), GossipPeer { tx });
         tracing::info!(node_id = %self.node_id, peer = %peer_node_id, "gossip peer added");
         rx
     }
@@ -168,10 +168,7 @@ impl GossipRouter {
 
     /// Spawn a background task that periodically initiates gossip rounds.
     /// Returns a handle that can be used to cancel the task.
-    pub fn spawn_periodic_gossip(
-        &self,
-        interval: Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_periodic_gossip(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let router = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);

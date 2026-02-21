@@ -5,7 +5,13 @@ shell:
   nix develop
 
 fmt:
-  @echo "TODO: add formatter once language/tooling is locked"
+  cargo fmt --all
+
+check:
+  cargo clippy --all-targets
 
 test:
-  @echo "TODO: add protocol tests"
+  cargo test --all
+
+test-validator:
+  cd validator && npm run test

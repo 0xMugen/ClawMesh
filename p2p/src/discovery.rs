@@ -37,6 +37,14 @@ pub struct AnnounceMessage {
     pub capabilities: Vec<String>,
 }
 
+/// Query parameters for searching peers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PeerQuery {
+    pub status: Option<PeerStatus>,
+    pub capability: Option<String>,
+    pub mesh_id: Option<String>,
+}
+
 /// Gossip digest entry: agent_id + last_seen timestamp.
 /// Peers exchange digests to discover missing or stale entries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,10 +102,8 @@ impl MeshRegistry {
             agent_id: msg.agent_id.clone(),
             mesh_id: msg.mesh_id,
         });
-        self.bus.emit_patch_ready(
-            &self.mesh_id,
-            &format!("peer {} announced", msg.agent_id),
-        );
+        self.bus
+            .emit_patch_ready(&self.mesh_id, &format!("peer {} announced", msg.agent_id));
 
         entry
     }
@@ -113,10 +119,8 @@ impl MeshRegistry {
                 agent_id: agent_id.to_string(),
                 mesh_id: self.mesh_id.clone(),
             });
-            self.bus.emit_patch_ready(
-                &self.mesh_id,
-                &format!("peer {} departed", agent_id),
-            );
+            self.bus
+                .emit_patch_ready(&self.mesh_id, &format!("peer {} departed", agent_id));
         }
 
         removed
@@ -146,6 +150,48 @@ impl MeshRegistry {
     /// Count of registered peers.
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()
+    }
+
+    /// Find peers that advertise a specific capability.
+    pub async fn peers_by_capability(&self, capability: &str) -> Vec<PeerEntry> {
+        self.peers
+            .read()
+            .await
+            .values()
+            .filter(|p| p.capabilities.iter().any(|c| c == capability))
+            .cloned()
+            .collect()
+    }
+
+    /// Search peers by a combination of filters.
+    pub async fn search_peers(&self, query: &PeerQuery) -> Vec<PeerEntry> {
+        self.peers
+            .read()
+            .await
+            .values()
+            .filter(|p| {
+                // Filter by status if specified
+                if let Some(status) = query.status {
+                    if p.status != status {
+                        return false;
+                    }
+                }
+                // Filter by capability if specified
+                if let Some(ref cap) = query.capability {
+                    if !p.capabilities.iter().any(|c| c == cap) {
+                        return false;
+                    }
+                }
+                // Filter by mesh_id if specified
+                if let Some(ref mesh) = query.mesh_id {
+                    if p.mesh_id != *mesh {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -201,10 +247,7 @@ impl MeshRegistry {
                 let agent_id = entry.agent_id.clone();
                 let mesh_id = entry.mesh_id.clone();
                 peers.insert(agent_id.clone(), entry);
-                self.bus.emit(Event::PeerAnnounced {
-                    agent_id,
-                    mesh_id,
-                });
+                self.bus.emit(Event::PeerAnnounced { agent_id, mesh_id });
             }
         }
     }
@@ -268,6 +311,55 @@ mod tests {
         assert_eq!(reg.list_peers().await.len(), 2);
         assert_eq!(reg.peers_by_status(PeerStatus::Available).await.len(), 1);
         assert_eq!(reg.peers_by_status(PeerStatus::Busy).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn peers_by_capability() {
+        let reg = make_registry();
+
+        let mut alice = announce("alice");
+        alice.capabilities = vec!["matchmaking".into(), "scheduling".into()];
+        reg.handle_announce(alice).await;
+
+        let mut bob = announce("bob");
+        bob.capabilities = vec!["matchmaking".into()];
+        reg.handle_announce(bob).await;
+
+        let mut carol = announce("carol");
+        carol.capabilities = vec!["scheduling".into()];
+        reg.handle_announce(carol).await;
+
+        assert_eq!(reg.peers_by_capability("matchmaking").await.len(), 2);
+        assert_eq!(reg.peers_by_capability("scheduling").await.len(), 2);
+        assert_eq!(reg.peers_by_capability("unknown").await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn search_peers_combined() {
+        let reg = make_registry();
+
+        let mut alice = announce("alice");
+        alice.capabilities = vec!["matchmaking".into()];
+        reg.handle_announce(alice).await;
+
+        let mut bob = announce("bob");
+        bob.status = PeerStatus::Busy;
+        bob.capabilities = vec!["matchmaking".into()];
+        reg.handle_announce(bob).await;
+
+        // Search for available matchmaking peers
+        let query = PeerQuery {
+            status: Some(PeerStatus::Available),
+            capability: Some("matchmaking".into()),
+            mesh_id: None,
+        };
+        let results = reg.search_peers(&query).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].agent_id, "agent:alice");
+
+        // Search with no filters returns all
+        let all = reg.search_peers(&PeerQuery::default()).await;
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]

@@ -57,11 +57,8 @@ impl VectorClock {
 
     /// Compare this clock with another to determine causal ordering.
     pub fn partial_cmp_clock(&self, other: &VectorClock) -> ClockOrdering {
-        let all_keys: std::collections::HashSet<&String> = self
-            .clocks
-            .keys()
-            .chain(other.clocks.keys())
-            .collect();
+        let all_keys: std::collections::HashSet<&String> =
+            self.clocks.keys().chain(other.clocks.keys()).collect();
 
         let mut self_leq = true; // all self[k] <= other[k]
         let mut other_leq = true; // all other[k] <= self[k]
@@ -282,11 +279,7 @@ impl RoomStateSync {
     }
 
     /// Get the current value of a state key.
-    pub async fn get(
-        &self,
-        room_id: &str,
-        key: &str,
-    ) -> Result<StateEntry, StateError> {
+    pub async fn get(&self, room_id: &str, key: &str) -> Result<StateEntry, StateError> {
         let rooms = self.rooms.read().await;
         let room = rooms
             .get(room_id)
@@ -298,10 +291,7 @@ impl RoomStateSync {
     }
 
     /// List all state keys and their entries for a room.
-    pub async fn list_entries(
-        &self,
-        room_id: &str,
-    ) -> Result<Vec<StateEntry>, StateError> {
+    pub async fn list_entries(&self, room_id: &str) -> Result<Vec<StateEntry>, StateError> {
         let rooms = self.rooms.read().await;
         let room = rooms
             .get(room_id)
@@ -397,7 +387,10 @@ impl RoomStateSync {
     ///
     /// This merges the snapshot into existing state (if any), so it is safe
     /// to call even if some entries have already been received via deltas.
-    pub async fn restore_snapshot(&self, snapshot: StateSnapshot) -> Result<Vec<String>, StateError> {
+    pub async fn restore_snapshot(
+        &self,
+        snapshot: StateSnapshot,
+    ) -> Result<Vec<String>, StateError> {
         let mut rooms = self.rooms.write().await;
         let room = rooms
             .entry(snapshot.room_id.clone())
@@ -427,10 +420,7 @@ impl RoomStateSync {
     }
 
     /// Get the current aggregate vector clock for a room.
-    pub async fn room_clock(
-        &self,
-        room_id: &str,
-    ) -> Result<VectorClock, StateError> {
+    pub async fn room_clock(&self, room_id: &str) -> Result<VectorClock, StateError> {
         let rooms = self.rooms.read().await;
         let room = rooms
             .get(room_id)

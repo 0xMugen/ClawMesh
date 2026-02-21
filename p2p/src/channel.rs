@@ -1,4 +1,6 @@
-use ring::aead::{Aad, BoundKey, Nonce, NonceSequence, SealingKey, OpeningKey, UnboundKey, CHACHA20_POLY1305};
+use ring::aead::{
+    Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, CHACHA20_POLY1305,
+};
 use ring::agreement::{self, EphemeralPrivateKey, PublicKey, UnparsedPublicKey, X25519};
 use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
@@ -37,7 +39,10 @@ impl CounterNonce {
 impl NonceSequence for CounterNonce {
     fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
         let c = self.counter;
-        self.counter = self.counter.checked_add(1).ok_or(ring::error::Unspecified)?;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(ring::error::Unspecified)?;
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..4].copy_from_slice(&self.prefix);
         nonce_bytes[4..].copy_from_slice(&c.to_le_bytes());
