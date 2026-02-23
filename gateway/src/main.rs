@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -27,6 +32,115 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 #[derive(Clone)]
 struct AppState {
     node: MeshNode,
+    social: Arc<Mutex<SocialStore>>,
+}
+
+#[derive(Default)]
+struct SocialStore {
+    next_user_id: u64,
+    next_community_id: u64,
+    next_event_id: u64,
+    next_broadcast_id: u64,
+    users: HashMap<u64, User>,
+    users_by_username: HashMap<String, u64>,
+    communities: HashMap<u64, Community>,
+    memberships: HashMap<u64, HashSet<u64>>, // community_id -> user_ids
+    events: Vec<MeshEvent>,
+    broadcasts: Vec<Broadcast>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct User {
+    id: u64,
+    username: String,
+    display_name: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CommunityVisibility {
+    Open,
+    InviteOnly,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Community {
+    id: u64,
+    slug: String,
+    name: String,
+    owner_user_id: u64,
+    visibility: CommunityVisibility,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MeshEvent {
+    id: u64,
+    community_id: u64,
+    creator_user_id: u64,
+    title: String,
+    starts_at: DateTime<Utc>,
+    description: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Broadcast {
+    id: u64,
+    sender_user_id: u64,
+    community_ids: Vec<u64>,
+    message: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterAccountRequest {
+    username: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCommunityRequest {
+    owner_user_id: u64,
+    name: String,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default = "default_visibility")]
+    visibility: CommunityVisibility,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinCommunityRequest {
+    user_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateEventRequest {
+    creator_user_id: u64,
+    title: String,
+    starts_at: DateTime<Utc>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBroadcastRequest {
+    sender_user_id: u64,
+    community_ids: Vec<u64>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FeedResponse {
+    communities: Vec<Community>,
+    events: Vec<MeshEvent>,
+    broadcasts: Vec<Broadcast>,
+}
+
+fn default_visibility() -> CommunityVisibility {
+    CommunityVisibility::Open
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -189,6 +303,27 @@ fn build_router(state: AppState) -> Router {
         .route("/v0/auth/peers", get(list_authenticated_peers))
         // Maintenance
         .route("/v0/maintenance/purge", post(purge_expired))
+        // Social/community layer (accounts + meshes + events + broadcasts)
+        .route("/v0/accounts/register", post(register_account))
+        .route("/v0/users/:username", get(get_user_by_username))
+        .route(
+            "/v0/communities",
+            post(create_community).get(list_communities),
+        )
+        .route("/v0/communities/:community_id/join", post(join_community))
+        .route(
+            "/v0/communities/:community_id/members",
+            get(list_community_members),
+        )
+        .route(
+            "/v0/communities/:community_id/events",
+            post(create_event).get(list_events),
+        )
+        .route(
+            "/v0/broadcasts",
+            post(create_broadcast).get(list_broadcasts),
+        )
+        .route("/v0/feed/:user_id", get(get_feed))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -203,7 +338,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_addr: SocketAddr = bind_addr.parse()?;
 
     let node = MeshNode::new(&node_id, &mesh_id).expect("failed to generate mesh identity");
-    let state = AppState { node };
+    let state = AppState {
+        node,
+        social: Arc::new(Mutex::new(SocialStore::default())),
+    };
 
     let app = build_router(state);
 
@@ -268,6 +406,394 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "clawmesh-gateway",
     })
+}
+
+fn slugify(input: &str) -> String {
+    input
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' => ch,
+            _ => '-',
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+async fn register_account(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterAccountRequest>,
+) -> Result<Json<User>, (StatusCode, Json<ErrorResponse>)> {
+    let username = req.username.trim().to_lowercase();
+    if username.len() < 3 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid_username",
+                detail: "username must be at least 3 characters".to_string(),
+            }),
+        ));
+    }
+
+    let mut store = state.social.lock().expect("social store lock poisoned");
+    if store.users_by_username.contains_key(&username) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "username_taken",
+                detail: format!("username '{}' already exists", username),
+            }),
+        ));
+    }
+
+    store.next_user_id += 1;
+    let user = User {
+        id: store.next_user_id,
+        username: username.clone(),
+        display_name: req
+            .display_name
+            .unwrap_or_else(|| username.clone())
+            .trim()
+            .to_string(),
+        created_at: Utc::now(),
+    };
+    store.users_by_username.insert(username, user.id);
+    store.users.insert(user.id, user.clone());
+    Ok(Json(user))
+}
+
+async fn get_user_by_username(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> Result<Json<User>, (StatusCode, Json<ErrorResponse>)> {
+    let store = state.social.lock().expect("social store lock poisoned");
+    let key = username.to_lowercase();
+    let Some(user_id) = store.users_by_username.get(&key) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "not_found",
+                detail: format!("user '{}' not found", username),
+            }),
+        ));
+    };
+    let user = store
+        .users
+        .get(user_id)
+        .expect("user id indexed but missing")
+        .clone();
+    Ok(Json(user))
+}
+
+async fn create_community(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCommunityRequest>,
+) -> Result<Json<Community>, (StatusCode, Json<ErrorResponse>)> {
+    let mut store = state.social.lock().expect("social store lock poisoned");
+    if !store.users.contains_key(&req.owner_user_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "owner_not_found",
+                detail: format!("owner user {} does not exist", req.owner_user_id),
+            }),
+        ));
+    }
+
+    let slug = req
+        .slug
+        .map(|s| slugify(&s))
+        .unwrap_or_else(|| slugify(&req.name));
+    if slug.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid_slug",
+                detail: "community slug cannot be empty".to_string(),
+            }),
+        ));
+    }
+
+    if store.communities.values().any(|c| c.slug == slug) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "slug_taken",
+                detail: format!("community slug '{}' already exists", slug),
+            }),
+        ));
+    }
+
+    store.next_community_id += 1;
+    let community = Community {
+        id: store.next_community_id,
+        slug,
+        name: req.name,
+        owner_user_id: req.owner_user_id,
+        visibility: req.visibility,
+        created_at: Utc::now(),
+    };
+    store.communities.insert(community.id, community.clone());
+    store
+        .memberships
+        .entry(community.id)
+        .or_default()
+        .insert(community.owner_user_id);
+    Ok(Json(community))
+}
+
+async fn list_communities(State(state): State<AppState>) -> Json<Vec<Community>> {
+    let store = state.social.lock().expect("social store lock poisoned");
+    Json(store.communities.values().cloned().collect())
+}
+
+async fn join_community(
+    State(state): State<AppState>,
+    Path(community_id): Path<u64>,
+    Json(req): Json<JoinCommunityRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let mut store = state.social.lock().expect("social store lock poisoned");
+    if !store.users.contains_key(&req.user_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "user_not_found",
+                detail: format!("user {} does not exist", req.user_id),
+            }),
+        ));
+    }
+    let Some(community) = store.communities.get(&community_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "community_not_found",
+                detail: format!("community {} does not exist", community_id),
+            }),
+        ));
+    };
+
+    if matches!(community.visibility, CommunityVisibility::InviteOnly)
+        && req.user_id != community.owner_user_id
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "invite_required",
+                detail: "community is invite-only".to_string(),
+            }),
+        ));
+    }
+
+    store
+        .memberships
+        .entry(community_id)
+        .or_default()
+        .insert(req.user_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_community_members(
+    State(state): State<AppState>,
+    Path(community_id): Path<u64>,
+) -> Result<Json<Vec<User>>, (StatusCode, Json<ErrorResponse>)> {
+    let store = state.social.lock().expect("social store lock poisoned");
+    if !store.communities.contains_key(&community_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "community_not_found",
+                detail: format!("community {} does not exist", community_id),
+            }),
+        ));
+    }
+    let members = store
+        .memberships
+        .get(&community_id)
+        .cloned()
+        .unwrap_or_default();
+    let users = members
+        .iter()
+        .filter_map(|id| store.users.get(id).cloned())
+        .collect();
+    Ok(Json(users))
+}
+
+async fn create_event(
+    State(state): State<AppState>,
+    Path(community_id): Path<u64>,
+    Json(req): Json<CreateEventRequest>,
+) -> Result<Json<MeshEvent>, (StatusCode, Json<ErrorResponse>)> {
+    let mut store = state.social.lock().expect("social store lock poisoned");
+    let Some(members) = store.memberships.get(&community_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "community_not_found",
+                detail: format!("community {} does not exist", community_id),
+            }),
+        ));
+    };
+    if !members.contains(&req.creator_user_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "not_member",
+                detail: "creator must be a member of the community".to_string(),
+            }),
+        ));
+    }
+
+    store.next_event_id += 1;
+    let event = MeshEvent {
+        id: store.next_event_id,
+        community_id,
+        creator_user_id: req.creator_user_id,
+        title: req.title,
+        starts_at: req.starts_at,
+        description: req.description,
+        created_at: Utc::now(),
+    };
+    store.events.push(event.clone());
+    Ok(Json(event))
+}
+
+async fn list_events(
+    State(state): State<AppState>,
+    Path(community_id): Path<u64>,
+) -> Result<Json<Vec<MeshEvent>>, (StatusCode, Json<ErrorResponse>)> {
+    let store = state.social.lock().expect("social store lock poisoned");
+    if !store.communities.contains_key(&community_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "community_not_found",
+                detail: format!("community {} does not exist", community_id),
+            }),
+        ));
+    }
+    let events = store
+        .events
+        .iter()
+        .filter(|e| e.community_id == community_id)
+        .cloned()
+        .collect();
+    Ok(Json(events))
+}
+
+async fn create_broadcast(
+    State(state): State<AppState>,
+    Json(req): Json<CreateBroadcastRequest>,
+) -> Result<Json<Broadcast>, (StatusCode, Json<ErrorResponse>)> {
+    let mut store = state.social.lock().expect("social store lock poisoned");
+    if !store.users.contains_key(&req.sender_user_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "sender_not_found",
+                detail: format!("sender user {} does not exist", req.sender_user_id),
+            }),
+        ));
+    }
+    if req.community_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid_targets",
+                detail: "at least one community target is required".to_string(),
+            }),
+        ));
+    }
+
+    for community_id in &req.community_ids {
+        let Some(members) = store.memberships.get(community_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "community_not_found",
+                    detail: format!("community {} does not exist", community_id),
+                }),
+            ));
+        };
+        if !members.contains(&req.sender_user_id) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "not_member",
+                    detail: format!(
+                        "sender must be a member of community {} to broadcast",
+                        community_id
+                    ),
+                }),
+            ));
+        }
+    }
+
+    store.next_broadcast_id += 1;
+    let broadcast = Broadcast {
+        id: store.next_broadcast_id,
+        sender_user_id: req.sender_user_id,
+        community_ids: req.community_ids,
+        message: req.message,
+        created_at: Utc::now(),
+    };
+    store.broadcasts.push(broadcast.clone());
+    Ok(Json(broadcast))
+}
+
+async fn list_broadcasts(State(state): State<AppState>) -> Json<Vec<Broadcast>> {
+    let store = state.social.lock().expect("social store lock poisoned");
+    Json(store.broadcasts.clone())
+}
+
+async fn get_feed(
+    State(state): State<AppState>,
+    Path(user_id): Path<u64>,
+) -> Result<Json<FeedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let store = state.social.lock().expect("social store lock poisoned");
+    if !store.users.contains_key(&user_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "user_not_found",
+                detail: format!("user {} does not exist", user_id),
+            }),
+        ));
+    }
+
+    let joined: HashSet<u64> = store
+        .memberships
+        .iter()
+        .filter_map(|(community_id, users)| users.contains(&user_id).then_some(*community_id))
+        .collect();
+
+    let communities = joined
+        .iter()
+        .filter_map(|id| store.communities.get(id).cloned())
+        .collect();
+
+    let events = store
+        .events
+        .iter()
+        .filter(|e| joined.contains(&e.community_id))
+        .cloned()
+        .collect();
+
+    let broadcasts = store
+        .broadcasts
+        .iter()
+        .filter(|b| b.community_ids.iter().any(|id| joined.contains(id)))
+        .cloned()
+        .collect();
+
+    Ok(Json(FeedResponse {
+        communities,
+        events,
+        broadcasts,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -582,10 +1108,7 @@ async fn route_envelope(
     // Reject expired envelopes.
     if let Some(expiry) = envelope.expiry {
         if expiry < Utc::now() {
-            let detail = format!(
-                "envelope expired at {}",
-                expiry.to_rfc3339()
-            );
+            let detail = format!("envelope expired at {}", expiry.to_rfc3339());
             warn!(%detail, "expired envelope rejected");
             return Err((
                 StatusCode::GONE,
@@ -1475,12 +1998,7 @@ async fn federation_relay(
         let target_mesh = body.target_mesh.clone();
 
         // Not for us — if we have a link to the target mesh, forward it
-        if state
-            .node
-            .federation()
-            .is_linked(&target_mesh)
-            .await
-        {
+        if state.node.federation().is_linked(&target_mesh).await {
             state
                 .node
                 .federation()
@@ -2663,10 +3181,7 @@ mod tests {
     #[tokio::test]
     async fn federation_status_returns_local_mesh() {
         let app = test_app();
-        let resp = app
-            .oneshot(get("/v0/federation/status"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(get("/v0/federation/status")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["local_mesh_id"], "mesh-test");
@@ -2689,10 +3204,7 @@ mod tests {
         assert_eq!(body["mesh_id"], "mesh-remote");
 
         let app = build_router(state.clone());
-        let resp = app
-            .oneshot(get("/v0/federation/links"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(get("/v0/federation/links")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         let links = body.as_array().unwrap();
@@ -2701,10 +3213,7 @@ mod tests {
 
         // Status should reflect the link
         let app = build_router(state);
-        let resp = app
-            .oneshot(get("/v0/federation/status"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(get("/v0/federation/status")).await.unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["linked_meshes"], 1);
     }
@@ -2729,10 +3238,7 @@ mod tests {
         assert_eq!(body["status"], "unlinked");
 
         let app = build_router(state);
-        let resp = app
-            .oneshot(get("/v0/federation/links"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(get("/v0/federation/links")).await.unwrap();
         let body = body_json(resp.into_body()).await;
         assert!(body.as_array().unwrap().is_empty());
     }
@@ -2962,11 +3468,8 @@ mod tests {
         let nonce = challenge_body["nonce"].as_str().unwrap();
 
         // Step 2: Sign the challenge
-        let nonce_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            nonce,
-        )
-        .unwrap();
+        let nonce_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, nonce).unwrap();
         let sig = identity.sign(&nonce_bytes);
 
         // Step 3: Respond
@@ -3003,7 +3506,10 @@ mod tests {
     #[tokio::test]
     async fn purge_expired_returns_ok() {
         let app = test_app();
-        let resp = app.oneshot(post_empty("/v0/maintenance/purge")).await.unwrap();
+        let resp = app
+            .oneshot(post_empty("/v0/maintenance/purge"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "ok");
