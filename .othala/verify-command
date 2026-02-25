@@ -1,0 +1,1 @@
+nix develop -c bash -lc 'cargo check -p gateway'
